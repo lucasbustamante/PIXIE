@@ -105,16 +105,23 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       overflow: hidden;
       border-radius: 18px;
       background: #000;
-      aspect-ratio: 4 / 3;
+      aspect-ratio: 4 / 3; /* mantém a prévia na horizontal */
       display: flex;
       align-items: center;
       justify-content: center;
     }
     #stream {
+      /*
+        Sem deformar: o elemento mantém a proporção original 4:3.
+        A rotação para a esquerda é feita por CSS e o zoom é uniforme.
+        Como 90° transforma 4:3 em 3:4, usamos overflow hidden no quadro
+        para cortar as bordas, sem esticar nem achatar a imagem.
+      */
       width: 100%;
-      height: 100%;
-      object-fit: cover;
-      transform: scaleX(-1);
+      height: auto;
+      display: block;
+      transform: rotate(-90deg) scaleX(-1) scale(1.34);
+      transform-origin: center center;
     }
     .frame {
       pointer-events: none;
@@ -154,6 +161,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     .flash { background: #8b5cf6; }
     .full { grid-column: 1 / -1; }
     select { width: 100%; }
+    .toggle {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: #2d2d38;
+      border-radius: 14px;
+      padding: 12px;
+      font-size: 14px;
+      font-weight: bold;
+    }
+    .toggle input { transform: scale(1.25); }
     .preview {
       margin-top: 12px;
       display: none;
@@ -220,10 +239,20 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           <option value="f-noir">Filtro: Noir</option>
         </select>
 
+        <label class="toggle">
+          <input type="checkbox" id="dateStampToggle" checked>
+          Ativar data/hora estilo câmera antiga
+        </label>
+
+        <label class="toggle">
+          <input type="checkbox" id="flashToggle">
+          Usar flash somente ao tirar foto
+        </label>
+
         <button class="photo" onclick="takePhoto()">📸 Tirar foto</button>
         <button id="recordBtn" class="record" onclick="toggleRecord()">⏺ Gravar</button>
-        <button class="flash" onclick="flashOn()">⚡ Flash</button>
         <button onclick="toggleFrame()">▢ Moldura</button>
+        <button onclick="restartStream()">↻ Atualizar câmera</button>
       </div>
 
       <div class="hint">
@@ -241,6 +270,8 @@ const statusEl = document.getElementById('status');
 const preview = document.getElementById('preview');
 const frame = document.getElementById('frame');
 const recordBtn = document.getElementById('recordBtn');
+const dateStampToggle = document.getElementById('dateStampToggle');
+const flashToggle = document.getElementById('flashToggle');
 
 let mediaRecorder = null;
 let recordedChunks = [];
@@ -267,16 +298,51 @@ function cssFilterForClass(cls) {
   return map[cls] || 'none';
 }
 
-function drawFilteredToCanvas(canvas) {
+function drawOldCameraDate(ctx, w, h) {
+  if (!dateStampToggle.checked) return;
+
+  const now = new Date();
+  const months = ['JAN','FEV','MAR','ABR','MAI','JUN','JUL','AGO','SET','OUT','NOV','DEZ'];
+  const dateTxt = `${months[now.getMonth()]} ${String(now.getDate()).padStart(2, '0')} ${now.getFullYear()}`;
+  const timeTxt = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+  ctx.save();
+  ctx.font = 'bold 30px monospace';
+  ctx.textBaseline = 'top';
+  ctx.lineWidth = 5;
+  ctx.strokeStyle = 'rgba(0,0,0,.65)';
+  ctx.fillStyle = 'rgba(255,255,255,.94)';
+  ctx.strokeText('PLAY', 18, 18);
+  ctx.fillText('PLAY', 18, 18);
+
+  ctx.textBaseline = 'bottom';
+  ctx.strokeText(timeTxt, 18, h - 58);
+  ctx.fillText(timeTxt, 18, h - 58);
+  ctx.strokeText(dateTxt, 18, h - 18);
+  ctx.fillText(dateTxt, 18, h - 18);
+  ctx.strokeText('VHS Cam', w - 150, h - 18);
+  ctx.fillText('VHS Cam', w - 150, h - 18);
+  ctx.restore();
+}
+
+function drawRotatedImage(ctx, source, w, h) {
+  // Rotação real para a esquerda, sem esticar/achatar.
+  // O zoom é uniforme para preencher o quadro horizontal; o excesso é cortado.
+  const zoom = 1.34;
+  ctx.translate(w / 2, h / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.scale(-zoom, zoom);
+  ctx.drawImage(source, -w / 2, -h / 2, w, h);
+}
+
+function drawFilteredSourceToCanvas(source, canvas) {
   const ctx = canvas.getContext('2d');
   const w = canvas.width;
   const h = canvas.height;
   ctx.save();
   ctx.clearRect(0, 0, w, h);
   ctx.filter = cssFilterForClass(filterSelect.value);
-  ctx.translate(w, 0);
-  ctx.scale(-1, 1);
-  ctx.drawImage(streamImg, 0, 0, w, h);
+  drawRotatedImage(ctx, source, w, h);
   ctx.restore();
 
   if (frameOn) {
@@ -286,13 +352,54 @@ function drawFilteredToCanvas(canvas) {
     ctx.strokeRect(28, 28, w - 56, h - 56);
     ctx.restore();
   }
+
+  drawOldCameraDate(ctx, w, h);
 }
 
-function takePhoto() {
+function drawFilteredToCanvas(canvas) {
+  drawFilteredSourceToCanvas(streamImg, canvas);
+}
+
+async function takePhoto() {
   const canvas = document.createElement('canvas');
   canvas.width = 640;
   canvas.height = 480;
-  drawFilteredToCanvas(canvas);
+
+  // Sem flash: usa o frame atual da prévia, rápido e sem piscar a tela.
+  if (!flashToggle.checked) {
+    drawFilteredToCanvas(canvas);
+    showPhotoFromCanvas(canvas, 'Foto criada sem flash.');
+    return;
+  }
+
+  // Com flash: não liga o LED ao clicar no botão de flash.
+  // O LED acende só no momento da foto, captura o JPG real e apaga em seguida.
+  statusEl.textContent = 'Tirando foto com flash...';
+  await stopStreamAndWait(false);
+
+  try {
+    await fetch('/flash_on?ts=' + Date.now(), { cache: 'no-store' });
+    await new Promise(resolve => setTimeout(resolve, 250));
+
+    const resp = await fetch('/capture?ts=' + Date.now(), { cache: 'no-store' });
+    const blob = await resp.blob();
+    const img = new Image();
+    img.onload = async () => {
+      drawFilteredSourceToCanvas(img, canvas);
+      showPhotoFromCanvas(canvas, 'Foto criada com flash.');
+      URL.revokeObjectURL(img.src);
+      await fetch('/flash_off?ts=' + Date.now(), { cache: 'no-store' });
+      restartStream();
+    };
+    img.src = URL.createObjectURL(blob);
+  } catch (e) {
+    statusEl.textContent = 'Erro ao tirar foto com flash.';
+    await fetch('/flash_off?ts=' + Date.now(), { cache: 'no-store' }).catch(() => {});
+    restartStream();
+  }
+}
+
+function showPhotoFromCanvas(canvas, message) {
   const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
 
   preview.style.display = 'block';
@@ -306,7 +413,7 @@ function takePhoto() {
   link.textContent = 'Baixar foto';
   preview.appendChild(img);
   preview.appendChild(link);
-  statusEl.textContent = 'Foto criada com filtro aplicado.';
+  statusEl.textContent = message;
 }
 
 function toggleFrame() {
@@ -315,12 +422,18 @@ function toggleFrame() {
   statusEl.textContent = frameOn ? 'Moldura ativada.' : 'Moldura desativada.';
 }
 
-function flashOn() {
-  fetch('/flash').then(() => {
-    statusEl.textContent = 'Flash acionado.';
-  }).catch(() => {
-    statusEl.textContent = 'Não foi possível acionar o flash.';
-  });
+async function restartStream() {
+  streamImg.src = '/stream?ts=' + Date.now();
+}
+
+async function stopStreamAndWait(showBlank = true) {
+  // O WebServer padrão do Arduino fica preso no stream MJPEG.
+  // Para capturar foto/flash responderem, encerramos a conexão do stream antes.
+  streamImg.removeAttribute('src');
+  if (showBlank) {
+    streamImg.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
+  }
+  await new Promise(resolve => setTimeout(resolve, 900));
 }
 
 function toggleRecord() {
@@ -449,6 +562,8 @@ bool initCamera() {
     s->set_brightness(s, 0);
     s->set_contrast(s, 1);
     s->set_saturation(s, 0);
+    s->set_hmirror(s, 0);
+    s->set_vflip(s, 0);
     s->set_framesize(s, psramFound() ? FRAMESIZE_VGA : FRAMESIZE_QVGA);
   }
 
@@ -504,11 +619,37 @@ void handleStream() {
 }
 
 // ====== FLASH ======
+void setFlash(bool on) {
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, on ? HIGH : LOW);
+}
+
 void handleFlash() {
-  digitalWrite(FLASH_LED_PIN, HIGH);
-  delay(180);
-  digitalWrite(FLASH_LED_PIN, LOW);
+  int ms = 700;
+  if (server.hasArg("ms")) {
+    ms = server.arg("ms").toInt();
+    if (ms < 50) ms = 50;
+    if (ms > 3000) ms = 3000;
+  }
+
+  setFlash(true);
+  delay(ms);
+  setFlash(false);
+
+  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/plain", "OK");
+}
+
+void handleFlashOn() {
+  setFlash(true);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", "FLASH ON");
+}
+
+void handleFlashOff() {
+  setFlash(false);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", "FLASH OFF");
 }
 
 void handleNotFound() {
@@ -519,8 +660,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  pinMode(FLASH_LED_PIN, OUTPUT);
-  digitalWrite(FLASH_LED_PIN, LOW);
+  setFlash(false);
 
   Serial.println();
   Serial.println("Iniciando ESP32-CAM Charmera...");
@@ -554,6 +694,8 @@ void setup() {
   server.on("/capture", HTTP_GET, handleCapture);
   server.on("/stream", HTTP_GET, handleStream);
   server.on("/flash", HTTP_GET, handleFlash);
+  server.on("/flash_on", HTTP_GET, handleFlashOn);
+  server.on("/flash_off", HTTP_GET, handleFlashOff);
   server.onNotFound(handleNotFound);
 
   server.begin();
