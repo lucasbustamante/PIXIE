@@ -6,13 +6,13 @@
 // --- Pinos do display ---
 #define TFT_CS   13
 #define TFT_DC   15
-#define TFT_RST  2
+#define TFT_RST  16
 #define TFT_MOSI 12
 #define TFT_SCLK 14
 
-// --- Botão e flash ---
-#define BUTTON_PIN 16
-#define FLASH_PIN  4
+// --- Botões e flash ---
+#define BUTTON_ADC_PIN 2
+#define FLASH_PIN      4
 
 // ESP32-CAM AI Thinker
 #define PWDN_GPIO_NUM     32
@@ -37,9 +37,15 @@ Adafruit_ST7735 tft = Adafruit_ST7735(&vspi, TFT_CS, TFT_DC, TFT_RST);
 
 uint16_t lineBuffer[80];
 
-bool lastButtonState = HIGH;
-unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 250;
+unsigned long lastButtonTime = 0;
+const unsigned long debounceDelay = 350;
+
+enum ButtonType {
+  BTN_NONE,
+  BTN_FOTO,
+  BTN_UP,
+  BTN_DOWN
+};
 
 uint16_t swapRB(uint16_t color) {
   uint8_t r = (color >> 11) & 0x1F;
@@ -49,14 +55,20 @@ uint16_t swapRB(uint16_t color) {
   return (b << 11) | (g << 5) | r;
 }
 
+void mostrarMensagem(const char *msg) {
+  tft.fillRect(0, 0, 80, 20, ST77XX_BLACK);
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(5, 6);
+  tft.print(msg);
+}
+
 void mostrarFrame(camera_fb_t *fb) {
   const int cropLeft = 40;
   const int offsetY  = 20;
 
-  // Correção: desenha as linhas de baixo para cima no display
   for (int y = 0; y < 120; y++) {
     int sourceY = 119 - y;
-
     uint16_t *src = (uint16_t *)(fb->buf + sourceY * 160 * 2);
 
     for (int x = 0; x < 80; x++) {
@@ -68,6 +80,29 @@ void mostrarFrame(camera_fb_t *fb) {
   }
 }
 
+ButtonType lerBotao() {
+  int valor = analogRead(BUTTON_ADC_PIN);
+
+  Serial.print("ADC GPIO2: ");
+  Serial.println(valor);
+
+  // Ajuste essas faixas conforme os valores que aparecerem no Serial Monitor
+
+if (valor < 100) {
+    return BTN_FOTO;
+  }
+
+  if (valor > 200 && valor < 900) {
+    return BTN_DOWN;
+  }
+
+  if (valor > 900 && valor < 3900) {
+    return BTN_UP;
+  }
+
+  return BTN_NONE;
+}
+
 void tirarFotoComFlash() {
   digitalWrite(FLASH_PIN, HIGH);
   delay(150);
@@ -77,22 +112,20 @@ void tirarFotoComFlash() {
   if (fb) {
     mostrarFrame(fb);
     esp_camera_fb_return(fb);
-
-    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.setCursor(5, 5);
-    tft.print("FOTO!");
+    mostrarMensagem("FOTO!");
   }
 
-  delay(300);
+  delay(250);
   digitalWrite(FLASH_PIN, LOW);
 }
 
 void setup() {
   Serial.begin(115200);
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(FLASH_PIN, OUTPUT);
   digitalWrite(FLASH_PIN, LOW);
+
+  pinMode(BUTTON_ADC_PIN, INPUT);
 
   Serial.printf("PSRAM detectada: %d bytes\n", ESP.getPsramSize());
 
@@ -100,10 +133,9 @@ void setup() {
 
   tft.initR(INITR_MINI160x80);
   tft.setSPISpeed(40000000);
-
   tft.setRotation(2);
   tft.fillScreen(ST77XX_BLACK);
-  tft.invertDisplay(true);
+  tft.invertDisplay(false);
 
   camera_config_t config;
 
@@ -152,11 +184,8 @@ void setup() {
 
   sensor_t *s = esp_camera_sensor_get();
 
-  // Deixa sem inversão no sensor.
-  // A correção foi feita no desenho do frame.
   s->set_vflip(s, 0);
   s->set_hmirror(s, 0);
-
   s->set_whitebal(s, 1);
   s->set_gain_ctrl(s, 1);
   s->set_exposure_ctrl(s, 1);
@@ -167,20 +196,26 @@ void setup() {
 }
 
 void loop() {
-  bool buttonState = digitalRead(BUTTON_PIN);
+  ButtonType botao = lerBotao();
 
-  if (buttonState == LOW && lastButtonState == HIGH && millis() - lastDebounceTime > debounceDelay) {
-    lastDebounceTime = millis();
-    tirarFotoComFlash();
+  if (botao != BTN_NONE && millis() - lastButtonTime > debounceDelay) {
+    lastButtonTime = millis();
+
+    if (botao == BTN_FOTO) {
+      tirarFotoComFlash();
+    } 
+    else if (botao == BTN_UP) {
+      mostrarMensagem("UP");
+    } 
+    else if (botao == BTN_DOWN) {
+      mostrarMensagem("DOWN");
+    }
   }
-
-  lastButtonState = buttonState;
 
   camera_fb_t *fb = esp_camera_fb_get();
 
   if (!fb) return;
 
   mostrarFrame(fb);
-
   esp_camera_fb_return(fb);
 }
