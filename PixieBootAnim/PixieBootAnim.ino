@@ -2,6 +2,7 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
+#include "boot_animation.h"
 
 // --- Pinos do display ---
 #define TFT_CS   13
@@ -9,7 +10,7 @@
 #define TFT_RST  16
 #define TFT_MOSI 12
 #define TFT_SCLK 14
-#define TFT_BL   1   // Backlight do display
+#define TFT_BL   1
 
 // --- Botões e flash ---
 #define BUTTON_ADC_PIN 2
@@ -36,7 +37,7 @@
 SPIClass vspi(VSPI);
 Adafruit_ST7735 tft = Adafruit_ST7735(&vspi, TFT_CS, TFT_DC, TFT_RST);
 
-uint16_t lineBuffer[80];
+uint16_t lineBuffer[160];
 
 bool sistemaLigado = true;
 bool cameraLigada = false;
@@ -75,6 +76,49 @@ void backlightOn() {
 
 void backlightOff() {
   digitalWrite(TFT_BL, LOW);
+}
+
+bool lerPixelBitmapPROGMEM(const unsigned char *bitmap, int x, int y, int w) {
+  int byteIndex = y * ((w + 7) / 8) + (x / 8);
+  uint8_t byteValue = pgm_read_byte(bitmap + byteIndex);
+  return byteValue & (0x80 >> (x % 8));
+}
+
+void desenharFrameTelaToda(const unsigned char *frame) {
+  int telaW = tft.width();
+  int telaH = tft.height();
+
+  for (int y = 0; y < telaH; y++) {
+    int srcY = (y * BOOT_ANIM_HEIGHT) / telaH;
+
+    for (int x = 0; x < telaW; x++) {
+      int srcX = (x * BOOT_ANIM_WIDTH) / telaW;
+
+      bool pixel = lerPixelBitmapPROGMEM(frame, srcX, srcY, BOOT_ANIM_WIDTH);
+      lineBuffer[x] = pixel ? ST77XX_WHITE : ST77XX_BLACK;
+    }
+
+    tft.drawRGBBitmap(0, y, lineBuffer, telaW, 1);
+  }
+}
+
+void mostrarAnimacaoInicial() {
+  tft.setRotation(3);
+  tft.fillScreen(ST77XX_BLACK);
+
+  for (int i = 0; i < BOOT_ANIM_FRAME_COUNT; i++) {
+    const unsigned char *frame =
+      (const unsigned char *)pgm_read_ptr(&boot_anim_frames[i]);
+
+    desenharFrameTelaToda(frame);
+
+    delay(BOOT_ANIM_DELAY_MS);
+  }
+
+  delay(150);
+
+  tft.setRotation(2);
+  tft.fillScreen(ST77XX_BLACK);
 }
 
 void mostrarMensagem(const char *msg) {
@@ -188,10 +232,11 @@ void ligarSistema() {
 
   tft.initR(INITR_MINI160x80);
   tft.setSPISpeed(40000000);
-  tft.setRotation(2);
   tft.invertDisplay(false);
   tft.enableDisplay(true);
   tft.fillScreen(ST77XX_BLACK);
+
+  mostrarAnimacaoInicial();
 
   iniciarCamera();
 
@@ -289,13 +334,14 @@ void setup() {
 
   tft.initR(INITR_MINI160x80);
   tft.setSPISpeed(40000000);
-  tft.setRotation(2);
-  tft.fillScreen(ST77XX_BLACK);
   tft.invertDisplay(false);
   tft.enableDisplay(true);
 
+  mostrarAnimacaoInicial();
+
   iniciarCamera();
 
+  tft.setRotation(2);
   tft.fillScreen(ST77XX_BLACK);
 }
 
