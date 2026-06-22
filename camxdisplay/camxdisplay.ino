@@ -9,7 +9,7 @@
 #define TFT_RST  16
 #define TFT_MOSI 12
 #define TFT_SCLK 14
-#define TFT_BL   0   // Backlight do display
+#define TFT_BL   1   // Backlight do display
 
 // --- Botões e flash ---
 #define BUTTON_ADC_PIN 2
