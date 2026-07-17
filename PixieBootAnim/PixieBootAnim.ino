@@ -2,6 +2,7 @@
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
 #include "esp_sleep.h"
+#include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include <FS.h>
 #include <SD_MMC.h>
@@ -18,7 +19,7 @@
 #define PROJECT_DEVELOPER   "Desenvolvedor: edite este texto"
 #define DCIM_DIR            "/DCIM"
 #define PHOTO_PREFIX        "PHOTO_"
-#define PHOTO_EXTENSION     ".bmp"
+#define PHOTO_EXTENSION     ".jpg"
 
 // --- Pinos do display ST7735 0.96 80x160 ---
 #define TFT_CS   13
@@ -61,8 +62,9 @@
 // SD_MMC.begin() pode demorar ou travar quando o SD compartilha pinos com TFT.
 #define CHECK_SD_ON_BOOT 0
 
-#define SCREEN_W 80
-#define SCREEN_H 160
+#define TFT_APP_ROTATION 3
+#define SCREEN_W 160
+#define SCREEN_H 80
 #define MAX_PHOTOS 120
 #define PHOTO_PATH_LEN 48
 #define CAPTURE_SRC_W 160
@@ -71,6 +73,11 @@
 #define PHOTO_H 120
 #define PHOTO_CROP_LEFT 40
 #define BMP_HEADER_SIZE 54
+#define PREVIEW_AREA_Y 12
+#define PREVIEW_AREA_H 68
+#define GALLERY_INFO_Y 66
+#define CAMERA_CAPTURE_JPEG_QUALITY 8
+#define CAMERA_PREVIEW_JPEG_QUALITY 14
 #define SD_IO_BUFFER_SIZE 512
 
 #define COLOR_BG       0x0000
@@ -88,7 +95,7 @@ SPIClass vspi(VSPI);
 Adafruit_ST7735 tft = Adafruit_ST7735(&vspi, TFT_CS, TFT_DC, TFT_RST);
 Preferences preferences;
 
-uint16_t lineBuffer[160];
+uint16_t lineBuffer[SCREEN_W];
 DMA_ATTR uint8_t sdIoBuffer[SD_IO_BUFFER_SIZE];
 
 enum AppState {
@@ -174,13 +181,18 @@ ButtonType lastRawButton = BTN_NONE;
 bool longEventSent = false;
 bool powerEventSent = false;
 
+int16_t jpegViewportX = 0;
+int16_t jpegViewportY = 0;
+int16_t jpegViewportW = SCREEN_W;
+int16_t jpegViewportH = SCREEN_H;
+
 const unsigned long debounceDelay = 80;
 const unsigned long repeatDelayMs = 650;
 const unsigned long repeatIntervalMs = 240;
 const unsigned long backHoldMs = 900;
 const unsigned long tempoSegurarPower = 3000;
 const unsigned long stuckButtonMs = 8500;
-const unsigned long cameraFrameIntervalMs = 70;
+const unsigned long cameraFrameIntervalMs = 45;
 const unsigned long menuAnimMs = 130;
 
 const char *mainMenuItems[] = {"Camera", "Configuracoes", "Galeria", "Desligar"};
@@ -295,11 +307,16 @@ void logHeap(const char *label) {
 }
 
 void backlightOn() {
+  gpio_hold_dis((gpio_num_t)TFT_BL);
+  pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
+  gpio_set_level((gpio_num_t)TFT_BL, 1);
 }
 
 void backlightOff() {
+  pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, LOW);
+  gpio_set_level((gpio_num_t)TFT_BL, 0);
 }
 
 void restoreDisplayBus() {
@@ -309,7 +326,7 @@ void restoreDisplayBus() {
   digitalWrite(TFT_CS, HIGH);
   vspi.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
   tft.setSPISpeed(40000000);
-  tft.setRotation(2);
+  tft.setRotation(TFT_APP_ROTATION);
   tft.enableDisplay(true);
   pinMode(BUTTON_ADC_PIN, INPUT);
 }
@@ -367,7 +384,7 @@ void mostrarAnimacaoInicial() {
 
   delay(150);
 
-  tft.setRotation(2);
+  tft.setRotation(TFT_APP_ROTATION);
   tft.fillScreen(ST77XX_BLACK);
 }
 
@@ -403,18 +420,18 @@ void mostrarMensagem(const char *msg) {
 void showCenteredMessage(const char *title, const char *subtitle, uint16_t color) {
   tft.fillScreen(COLOR_BG);
   drawHeader(PROJECT_NAME);
-  centerText(title, 62, color, 1);
+  centerText(title, 34, color, 1);
   if (subtitle && subtitle[0]) {
-    centerText(subtitle, 78, COLOR_MUTED, 1);
+    centerText(subtitle, 50, COLOR_MUTED, 1);
   }
 }
 
 void mostrarContadorPower(const char *acao, int segundos) {
   tft.fillScreen(COLOR_BG);
-  centerText(acao, 42, COLOR_TEXT, 1);
+  centerText(acao, 22, COLOR_TEXT, 1);
   char numberText[8];
   snprintf(numberText, sizeof(numberText), "%d", segundos);
-  centerText(numberText, 68, COLOR_WARN, 3);
+  centerText(numberText, 42, COLOR_WARN, 3);
 }
 
 ButtonType lerBotao() {
@@ -498,7 +515,7 @@ ButtonEvent readButtonEvent() {
   return event;
 }
 
-camera_config_t makeCameraConfig(CameraMode mode) {
+camera_config_t makeCameraConfig(CameraMode mode, framesize_t frameSize, bool usePsramBuffer) {
   camera_config_t config = {};
 
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -524,20 +541,18 @@ camera_config_t makeCameraConfig(CameraMode mode) {
 
   config.xclk_freq_hz = 20000000;
 
-  if (mode == CAMERA_CAPTURE_JPEG) {
-    config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size = psramAvailable ? FRAMESIZE_VGA : FRAMESIZE_QVGA;
-    config.jpeg_quality = psramAvailable ? 10 : 12;
-    config.fb_count = 1;
-    config.fb_location = psramAvailable ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
-    config.grab_mode = CAMERA_GRAB_LATEST;
-  } else {
+  config.frame_size = frameSize;
+  config.fb_count = 1;
+  config.fb_location = usePsramBuffer ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+
+  if (mode == CAMERA_PREVIEW_RGB565) {
     config.pixel_format = PIXFORMAT_RGB565;
-    config.frame_size = FRAMESIZE_QQVGA;
-    config.jpeg_quality = 12;
-    config.fb_count = 1;
+    config.jpeg_quality = CAMERA_PREVIEW_JPEG_QUALITY;
     config.fb_location = CAMERA_FB_IN_DRAM;
-    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  } else {
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.jpeg_quality = CAMERA_CAPTURE_JPEG_QUALITY;
   }
 
   return config;
@@ -554,6 +569,19 @@ void applySensorDefaults() {
   s->set_exposure_ctrl(s, 1);
   s->set_brightness(s, 0);
   s->set_contrast(s, 0);
+}
+
+const char *frameSizeName(framesize_t frameSize) {
+  switch (frameSize) {
+    case FRAMESIZE_UXGA: return "UXGA";
+    case FRAMESIZE_SXGA: return "SXGA";
+    case FRAMESIZE_XGA: return "XGA";
+    case FRAMESIZE_SVGA: return "SVGA";
+    case FRAMESIZE_VGA: return "VGA";
+    case FRAMESIZE_QVGA: return "QVGA";
+    case FRAMESIZE_QQVGA: return "QQVGA";
+    default: return "OUTRO";
+  }
 }
 
 bool initializeCamera(CameraMode mode) {
@@ -576,21 +604,67 @@ bool initializeCamera(CameraMode mode) {
   digitalWrite(PWDN_GPIO_NUM, LOW);
   delay(20);
 
-  camera_config_t config = makeCameraConfig(mode);
-  esp_err_t err = esp_camera_init(&config);
+  struct CameraAttempt {
+    framesize_t frameSize;
+    bool usePsram;
+  };
 
-  if (err != ESP_OK) {
-    Serial.printf("Falha ao inicializar camera: 0x%x\n", err);
-    cameraLigada = false;
-    cameraMode = CAMERA_OFF;
-    return false;
+  CameraAttempt previewAttempts[] = {
+    {FRAMESIZE_QQVGA, false}
+  };
+
+  CameraAttempt captureAttempts[] = {
+    {FRAMESIZE_UXGA, true},
+    {FRAMESIZE_SXGA, true},
+    {FRAMESIZE_XGA, true},
+    {FRAMESIZE_SVGA, true},
+    {FRAMESIZE_VGA, true},
+    {FRAMESIZE_QVGA, true},
+    {FRAMESIZE_QVGA, false},
+    {FRAMESIZE_QQVGA, false}
+  };
+
+  CameraAttempt *attempts = mode == CAMERA_CAPTURE_JPEG ? captureAttempts : previewAttempts;
+  uint8_t attemptCount = mode == CAMERA_CAPTURE_JPEG ?
+                         sizeof(captureAttempts) / sizeof(captureAttempts[0]) :
+                         sizeof(previewAttempts) / sizeof(previewAttempts[0]);
+
+  for (uint8_t i = 0; i < attemptCount; i++) {
+    if (attempts[i].usePsram && !psramAvailable) continue;
+
+    camera_config_t config = makeCameraConfig(mode, attempts[i].frameSize, attempts[i].usePsram);
+    Serial.printf("Tentando camera %s %s buffer=%s\n",
+                  mode == CAMERA_CAPTURE_JPEG ? "JPEG" : "RGB565",
+                  frameSizeName(attempts[i].frameSize),
+                  attempts[i].usePsram ? "PSRAM" : "DRAM");
+
+    esp_err_t err = esp_camera_init(&config);
+
+    if (err == ESP_OK) {
+      applySensorDefaults();
+      cameraLigada = true;
+      cameraMode = mode;
+      Serial.printf("Camera inicializada em %s %s buffer=%s\n",
+                    mode == CAMERA_CAPTURE_JPEG ? "JPEG" : "RGB565",
+                    frameSizeName(attempts[i].frameSize),
+                    attempts[i].usePsram ? "PSRAM" : "DRAM");
+      return true;
+    }
+
+    Serial.printf("Falha ao inicializar camera %s %s: 0x%x\n",
+                  mode == CAMERA_CAPTURE_JPEG ? "JPEG" : "RGB565",
+                  frameSizeName(attempts[i].frameSize), err);
+    esp_camera_deinit();
+    digitalWrite(PWDN_GPIO_NUM, HIGH);
+    delay(80);
+    digitalWrite(PWDN_GPIO_NUM, LOW);
+    delay(80);
   }
 
-  applySensorDefaults();
-  cameraLigada = true;
-  cameraMode = mode;
-  Serial.printf("Camera inicializada em modo %s\n", mode == CAMERA_CAPTURE_JPEG ? "JPEG" : "RGB565");
-  return true;
+  cameraLigada = false;
+  cameraMode = CAMERA_OFF;
+  Serial.println("Falha ao inicializar camera em todas as resolucoes.");
+  return false;
 }
 
 bool iniciarCamera() {
@@ -904,8 +978,76 @@ void *allocImageBuffer(size_t size) {
 }
 
 bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
-  if (y >= SCREEN_H || x >= SCREEN_W) return false;
-  tft.drawRGBBitmap(x, y, bitmap, w, h);
+  int16_t clipX0 = x > jpegViewportX ? x : jpegViewportX;
+  int16_t clipY0 = y > jpegViewportY ? y : jpegViewportY;
+  int16_t xEnd = x + (int16_t)w;
+  int16_t yEnd = y + (int16_t)h;
+  int16_t viewXEnd = jpegViewportX + jpegViewportW;
+  int16_t viewYEnd = jpegViewportY + jpegViewportH;
+  int16_t clipX1 = xEnd < viewXEnd ? xEnd : viewXEnd;
+  int16_t clipY1 = yEnd < viewYEnd ? yEnd : viewYEnd;
+
+  if (clipX0 >= clipX1 || clipY0 >= clipY1) return true;
+
+  for (int16_t row = clipY0; row < clipY1; row++) {
+    uint16_t *src = bitmap + (row - y) * w + (clipX0 - x);
+    uint16_t drawW = clipX1 - clipX0;
+
+    for (uint16_t col = 0; col < drawW; col++) {
+      lineBuffer[col] = src[col];
+    }
+
+    tft.drawRGBBitmap(clipX0, row, lineBuffer, drawW, 1);
+  }
+
+  return true;
+}
+
+bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
+                              int16_t areaX, int16_t areaY, int16_t areaW, int16_t areaH,
+                              bool clearArea) {
+  if (!jpegBuffer || fileSize == 0) return false;
+
+  uint16_t jpgW = 0;
+  uint16_t jpgH = 0;
+  JRESULT sizeResult = TJpgDec.getJpgSize(&jpgW, &jpgH, jpegBuffer, fileSize);
+  if (sizeResult != JDR_OK || jpgW == 0 || jpgH == 0) {
+    Serial.println("Falha ao obter tamanho do JPEG.");
+    return false;
+  }
+
+  uint8_t scale = 1;
+  while ((jpgW / scale > areaW || jpgH / scale > areaH * 2) && scale < 8) {
+    scale *= 2;
+  }
+  while (jpgW / scale > areaW && scale < 8) {
+    scale *= 2;
+  }
+
+  int16_t drawW = jpgW / scale;
+  int16_t drawH = jpgH / scale;
+  int16_t drawX = areaX + (areaW - drawW) / 2;
+  int16_t drawY = areaY + (areaH - drawH) / 2;
+
+  jpegViewportX = areaX;
+  jpegViewportY = areaY;
+  jpegViewportW = areaW;
+  jpegViewportH = areaH;
+
+  if (clearArea) {
+    tft.fillRect(areaX, areaY, areaW, areaH, COLOR_BG);
+  }
+
+  TJpgDec.setJpgScale(scale);
+  TJpgDec.setSwapBytes(false);
+  TJpgDec.setCallback(tftJpegOutput);
+
+  JRESULT drawResult = TJpgDec.drawJpg(drawX, drawY, jpegBuffer, fileSize);
+  if (drawResult != JDR_OK) {
+    Serial.printf("Falha ao desenhar JPEG: %d\n", drawResult);
+    return false;
+  }
+
   return true;
 }
 
@@ -940,9 +1082,9 @@ bool drawBmpFromBuffer(const uint8_t *bmpBuffer, size_t fileSize, const char *pa
   drawHeader("Galeria");
 
   int16_t targetW = SCREEN_W;
-  int16_t targetH = 120;
+  int16_t targetH = GALLERY_INFO_Y;
   int16_t drawH = absH < targetH ? absH : targetH;
-  int16_t yOffset = 20 + (targetH - drawH) / 2;
+  int16_t yOffset = (targetH - drawH) / 2;
 
   for (int16_t y = 0; y < drawH; y++) {
     int32_t srcY = (int32_t)y * absH / drawH;
@@ -962,17 +1104,17 @@ bool drawBmpFromBuffer(const uint8_t *bmpBuffer, size_t fileSize, const char *pa
     yield();
   }
 
-  tft.fillRect(0, 138, SCREEN_W, 22, COLOR_BG);
-  tft.drawFastHLine(0, 137, SCREEN_W, COLOR_PANEL_2);
+  tft.fillRect(0, GALLERY_INFO_Y, SCREEN_W, SCREEN_H - GALLERY_INFO_Y, COLOR_BG);
+  tft.drawFastHLine(0, GALLERY_INFO_Y - 1, SCREEN_W, COLOR_PANEL_2);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(3, 141);
+  tft.setCursor(3, GALLERY_INFO_Y + 2);
   const char *baseName = strrchr(path, '/');
   tft.print(baseName ? baseName + 1 : path);
 
   char counter[20];
   snprintf(counter, sizeof(counter), "Foto %u de %u", index + 1, photoCount);
-  tft.setCursor(3, 151);
+  tft.setCursor(93, GALLERY_INFO_Y + 2);
   tft.setTextColor(COLOR_MUTED);
   tft.print(counter);
 
@@ -1040,51 +1182,25 @@ void showPhoto(int index) {
   }
 
   tft.fillScreen(COLOR_BG);
-  drawHeader("Galeria");
-
-  uint16_t jpgW = 0;
-  uint16_t jpgH = 0;
-  JRESULT sizeResult = TJpgDec.getJpgSize(&jpgW, &jpgH, jpegBuffer, fileSize);
-  if (sizeResult != JDR_OK || jpgW == 0 || jpgH == 0) {
-    heap_caps_free(jpegBuffer);
-    showCenteredMessage("JPEG corrompido", "", COLOR_BAD);
-    return;
-  }
-
-  uint8_t scale = 1;
-  while ((jpgW / scale > SCREEN_W || jpgH / scale > 122) && scale < 8) {
-    scale *= 2;
-  }
-
-  TJpgDec.setJpgScale(scale);
-  TJpgDec.setSwapBytes(true);
-  TJpgDec.setCallback(tftJpegOutput);
-
-  int16_t drawW = jpgW / scale;
-  int16_t drawH = jpgH / scale;
-  int16_t x = (SCREEN_W - drawW) / 2;
-  int16_t y = 22 + (112 - drawH) / 2;
-  if (y < 20) y = 20;
-
-  JRESULT drawResult = TJpgDec.drawJpg(x, y, jpegBuffer, fileSize);
+  bool drawResult = drawJpegBufferToViewport(jpegBuffer, fileSize, 0, 0, SCREEN_W, SCREEN_H, false);
   heap_caps_free(jpegBuffer);
 
-  if (drawResult != JDR_OK) {
+  if (!drawResult) {
     showCenteredMessage("Falha JPEG", "", COLOR_BAD);
     return;
   }
 
-  tft.fillRect(0, 138, SCREEN_W, 22, COLOR_BG);
-  tft.drawFastHLine(0, 137, SCREEN_W, COLOR_PANEL_2);
+  tft.fillRect(0, GALLERY_INFO_Y, SCREEN_W, SCREEN_H - GALLERY_INFO_Y, COLOR_BG);
+  tft.drawFastHLine(0, GALLERY_INFO_Y - 1, SCREEN_W, COLOR_PANEL_2);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(3, 141);
+  tft.setCursor(3, GALLERY_INFO_Y + 2);
   const char *baseName = strrchr(path, '/');
   tft.print(baseName ? baseName + 1 : path);
 
   char counter[20];
   snprintf(counter, sizeof(counter), "Foto %u de %u", index + 1, photoCount);
-  tft.setCursor(3, 151);
+  tft.setCursor(93, GALLERY_INFO_Y + 2);
   tft.setTextColor(COLOR_MUTED);
   tft.print(counter);
 }
@@ -1116,12 +1232,12 @@ void drawIcon(uint8_t icon, int16_t x, int16_t y, uint16_t color) {
 }
 
 int16_t animatedRowY(uint8_t current, uint8_t previous) {
-  int16_t targetY = 27 + current * 27;
+  int16_t targetY = 18 + current * 14;
   if (current == previous || millis() - menuAnimStartMs >= menuAnimMs) {
     return targetY;
   }
 
-  int16_t startY = 27 + previous * 27;
+  int16_t startY = 18 + previous * 14;
   unsigned long elapsed = millis() - menuAnimStartMs;
   return startY + ((targetY - startY) * (int16_t)elapsed) / (int16_t)menuAnimMs;
 }
@@ -1131,20 +1247,20 @@ void drawListMenu(const char *title, const char **items, uint8_t count, uint8_t 
   drawHeader(title);
 
   int16_t highlightY = animatedRowY(selected, previous);
-  tft.fillRoundRect(3, highlightY - 3, 74, 24, 5, COLOR_PANEL_2);
-  tft.drawRoundRect(3, highlightY - 3, 74, 24, 5, COLOR_ACCENT);
+  tft.fillRoundRect(4, highlightY - 2, 152, 13, 4, COLOR_PANEL_2);
+  tft.drawRoundRect(4, highlightY - 2, 152, 13, 4, COLOR_ACCENT);
 
   for (uint8_t i = 0; i < count; i++) {
-    int16_t y = 27 + i * 27;
+    int16_t y = 18 + i * 14;
     bool isSelected = i == selected;
     uint16_t color = isSelected ? COLOR_TEXT : COLOR_MUTED;
 
     if (mainMenu) {
-      drawIcon(i, 8, y + 2, isSelected ? COLOR_ACCENT : COLOR_MUTED);
-      tft.setCursor(28, y + 6);
+      drawIcon(i, 10, y - 2, isSelected ? COLOR_ACCENT : COLOR_MUTED);
+      tft.setCursor(32, y + 1);
     } else {
-      tft.fillCircle(13, y + 9, isSelected ? 3 : 2, isSelected ? COLOR_ACCENT : COLOR_MUTED);
-      tft.setCursor(22, y + 6);
+      tft.fillCircle(16, y + 4, isSelected ? 3 : 2, isSelected ? COLOR_ACCENT : COLOR_MUTED);
+      tft.setCursor(28, y + 1);
     }
 
     tft.setTextSize(1);
@@ -1152,20 +1268,22 @@ void drawListMenu(const char *title, const char **items, uint8_t count, uint8_t 
     tft.print(items[i]);
   }
 
-  tft.fillRect(30, 148, 20, 4, COLOR_PANEL);
-  int16_t posX = 30 + (selected * 20) / count;
-  tft.fillRect(posX, 148, 7, 4, COLOR_ACCENT);
+  tft.fillRect(136, 20, 4, 48, COLOR_PANEL);
+  int16_t posY = 20 + (selected * 48) / count;
+  tft.fillRect(136, posY, 4, 10, COLOR_ACCENT);
 }
 
 void drawCameraScreen() {
   tft.fillScreen(COLOR_BG);
-  drawHeader("Camera");
-  tft.drawRoundRect(0, 19, SCREEN_W, 122, 3, COLOR_PANEL_2);
+  tft.drawRoundRect(0, 0, SCREEN_W, SCREEN_H, 3, COLOR_PANEL_2);
   tft.setTextSize(1);
-  tft.setTextColor(COLOR_MUTED);
-  tft.setCursor(4, 146);
-  tft.print("UP/DOWN menu");
-  tft.setCursor(4, 156);
+  tft.setTextColor(COLOR_TEXT, COLOR_BG);
+  tft.setCursor(3, 3);
+  tft.print("Camera");
+  tft.setTextColor(COLOR_MUTED, COLOR_BG);
+  tft.setCursor(92, 3);
+  tft.print("UP/DOWN");
+  tft.setCursor(3, 69);
   tft.print(flashEnabled ? "Flash ON" : "Flash OFF");
 }
 
@@ -1183,8 +1301,7 @@ void drawSDInfo() {
 
   if (!beginSDSession(true)) {
     tft.setTextSize(1);
-    centerText("SD nao", 55, COLOR_WARN, 1);
-    centerText("encontrado", 68, COLOR_WARN, 1);
+    centerText("SD nao encontrado", 38, COLOR_WARN, 1);
   } else {
     uint64_t total = SD_MMC.totalBytes();
     uint64_t used = SD_MMC.usedBytes();
@@ -1202,21 +1319,21 @@ void drawSDInfo() {
 
     tft.setTextSize(1);
     tft.setTextColor(COLOR_TEXT);
-    tft.setCursor(4, 24);
+    tft.setCursor(4, 22);
     tft.print("Status: OK");
-    tft.setCursor(4, 36);
+    tft.setCursor(4, 34);
     tft.print("Tipo: ");
     tft.print(cardTypeText(type));
-    tft.setCursor(4, 48);
+    tft.setCursor(4, 46);
     tft.print("Total: ");
     tft.print(totalText);
-    tft.setCursor(4, 60);
+    tft.setCursor(86, 22);
     tft.print("Usado: ");
     tft.print(usedText);
-    tft.setCursor(4, 72);
+    tft.setCursor(86, 34);
     tft.print("Livre: ");
     tft.print(freeText);
-    tft.setCursor(4, 84);
+    tft.setCursor(86, 46);
     tft.print("Fotos: ");
     tft.print(storedPhotos);
 
@@ -1225,32 +1342,34 @@ void drawSDInfo() {
 
   const char *options[] = {"Formatar", "Voltar"};
   for (uint8_t i = 0; i < 2; i++) {
-    int16_t y = 112 + i * 22;
+    int16_t x = i == 0 ? 18 : 92;
     bool selected = i == sdInfoIndex;
     if (selected) {
-      tft.fillRoundRect(8, y - 2, 64, 18, 4, COLOR_PANEL_2);
-      tft.drawRoundRect(8, y - 2, 64, 18, 4, i == 0 ? COLOR_WARN : COLOR_ACCENT);
+      tft.fillRoundRect(x, 60, 54, 15, 4, COLOR_PANEL_2);
+      tft.drawRoundRect(x, 60, 54, 15, 4, i == 0 ? COLOR_WARN : COLOR_ACCENT);
     }
-    centerText(options[i], y + 3, selected ? COLOR_TEXT : COLOR_MUTED, 1);
+    tft.setTextSize(1);
+    tft.setTextColor(selected ? COLOR_TEXT : COLOR_MUTED);
+    tft.setCursor(x + 4, 64);
+    tft.print(options[i]);
   }
 }
 
 void drawFlashSettings() {
   tft.fillScreen(COLOR_BG);
   drawHeader("Flash");
-  centerText("Flash fisico", 42, COLOR_TEXT, 1);
+  centerText("Flash fisico", 24, COLOR_TEXT, 1);
 
-  tft.drawRoundRect(10, 68, 60, 28, 8, flashEnabled ? COLOR_OK : COLOR_MUTED);
+  tft.drawRoundRect(48, 38, 64, 24, 8, flashEnabled ? COLOR_OK : COLOR_MUTED);
   if (flashEnabled) {
-    tft.fillRoundRect(39, 72, 25, 20, 6, COLOR_OK);
-    centerText("ON", 78, COLOR_TEXT, 1);
+    tft.fillRoundRect(82, 42, 24, 16, 6, COLOR_OK);
+    centerText("ON", 47, COLOR_TEXT, 1);
   } else {
-    tft.fillRoundRect(16, 72, 25, 20, 6, COLOR_PANEL_2);
-    centerText("OFF", 78, COLOR_MUTED, 1);
+    tft.fillRoundRect(54, 42, 24, 16, 6, COLOR_PANEL_2);
+    centerText("OFF", 47, COLOR_MUTED, 1);
   }
 
-  centerText("OK alterna", 116, COLOR_MUTED, 1);
-  centerText("segure OK volta", 130, COLOR_MUTED, 1);
+  centerText("OK alterna | segure OK volta", 68, COLOR_MUTED, 1);
 }
 
 void drawAbout() {
@@ -1259,23 +1378,21 @@ void drawAbout() {
 
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(4, 24);
+  tft.setCursor(4, 22);
   tft.print(PROJECT_NAME);
-  tft.setCursor(4, 36);
+  tft.setCursor(4, 34);
   tft.print("Versao ");
   tft.print(PROJECT_VERSION);
-  tft.setCursor(4, 50);
+  tft.setCursor(4, 46);
   tft.print("ESP32-CAM");
-  tft.setCursor(4, 62);
+  tft.setCursor(82, 22);
   tft.print("camera digital");
-  tft.setCursor(4, 74);
-  tft.print("com display,");
-  tft.setCursor(4, 86);
-  tft.print("botoes e SD.");
+  tft.setCursor(82, 34);
+  tft.print("display/botoes/SD");
   tft.setTextColor(COLOR_MUTED);
-  tft.setCursor(4, 104);
+  tft.setCursor(4, 58);
   tft.print(PROJECT_DEVELOPER);
-  centerText("OK volta", 142, COLOR_ACCENT, 1);
+  centerText("OK volta", 70, COLOR_ACCENT, 1);
 }
 
 void drawGallery() {
@@ -1295,18 +1412,17 @@ void drawGallery() {
 void drawPowerConfirmation() {
   tft.fillScreen(COLOR_BG);
   drawHeader("Desligar");
-  centerText("Deseja", 44, COLOR_TEXT, 1);
-  centerText("desligar?", 58, COLOR_TEXT, 1);
+  centerText("Deseja desligar?", 30, COLOR_TEXT, 1);
 
   const char *options[] = {"Sim", "Nao"};
   for (uint8_t i = 0; i < 2; i++) {
-    int16_t x = i == 0 ? 7 : 43;
+    int16_t x = i == 0 ? 44 : 86;
     bool selected = i == confirmIndex;
-    tft.drawRoundRect(x, 92, 30, 24, 5, selected ? COLOR_ACCENT : COLOR_MUTED);
-    if (selected) tft.fillRoundRect(x + 2, 94, 26, 20, 4, i == 0 ? COLOR_WARN : COLOR_PANEL_2);
+    tft.drawRoundRect(x, 48, 34, 20, 5, selected ? COLOR_ACCENT : COLOR_MUTED);
+    if (selected) tft.fillRoundRect(x + 2, 50, 30, 16, 4, i == 0 ? COLOR_WARN : COLOR_PANEL_2);
     tft.setTextSize(1);
     tft.setTextColor(selected ? COLOR_TEXT : COLOR_MUTED);
-    tft.setCursor(x + 7, 100);
+    tft.setCursor(x + 8, 55);
     tft.print(options[i]);
   }
 }
@@ -1314,26 +1430,25 @@ void drawPowerConfirmation() {
 void drawFormatConfirmation() {
   tft.fillScreen(COLOR_BG);
   drawHeader("Formatar");
-  centerText("Formatar SD?", 45, COLOR_WARN, 1);
-  centerText("Apaga tudo", 62, COLOR_MUTED, 1);
+  centerText("Formatar SD? Apaga tudo", 30, COLOR_WARN, 1);
 
   const char *options[] = {"Sim", "Nao"};
   for (uint8_t i = 0; i < 2; i++) {
-    int16_t x = i == 0 ? 7 : 43;
+    int16_t x = i == 0 ? 44 : 86;
     bool selected = i == confirmIndex;
-    tft.drawRoundRect(x, 96, 30, 24, 5, selected ? (i == 0 ? COLOR_WARN : COLOR_ACCENT) : COLOR_MUTED);
-    if (selected) tft.fillRoundRect(x + 2, 98, 26, 20, 4, i == 0 ? COLOR_WARN : COLOR_PANEL_2);
+    tft.drawRoundRect(x, 48, 34, 20, 5, selected ? (i == 0 ? COLOR_WARN : COLOR_ACCENT) : COLOR_MUTED);
+    if (selected) tft.fillRoundRect(x + 2, 50, 30, 16, 4, i == 0 ? COLOR_WARN : COLOR_PANEL_2);
     tft.setTextSize(1);
     tft.setTextColor(selected ? COLOR_TEXT : COLOR_MUTED);
-    tft.setCursor(x + 7, 104);
+    tft.setCursor(x + 8, 55);
     tft.print(options[i]);
   }
 }
 
 void showCaptureAnimation() {
-  tft.drawRoundRect(5, 24, 70, 110, 4, COLOR_ACCENT);
+  tft.drawRoundRect(8, 8, 144, 64, 4, COLOR_ACCENT);
   delay(35);
-  tft.drawRoundRect(12, 32, 56, 94, 4, COLOR_ACCENT);
+  tft.drawRoundRect(20, 16, 120, 48, 4, COLOR_ACCENT);
   delay(35);
   tft.fillScreen(ST77XX_WHITE);
   delay(45);
@@ -1341,21 +1456,20 @@ void showCaptureAnimation() {
 }
 
 void mostrarFrame(camera_fb_t *fb) {
-  if (!fb || fb->format != PIXFORMAT_RGB565 || fb->width < 160 || fb->height < 120) return;
+  if (!fb || fb->format != PIXFORMAT_RGB565 || fb->width < SCREEN_W || fb->height < SCREEN_H) return;
 
-  const int cropLeft = 40;
-  const int offsetY = 20;
+  int cropTop = ((int)fb->height - SCREEN_H) / 2;
+  if (cropTop < 0) cropTop = 0;
 
-  for (int y = 0; y < 120; y++) {
-    int sourceY = 119 - y;
-    uint16_t *src = (uint16_t *)(fb->buf + sourceY * 160 * 2);
+  for (int y = 0; y < SCREEN_H; y++) {
+    int sourceY = y + cropTop;
+    uint16_t *src = (uint16_t *)(fb->buf + sourceY * fb->width * 2);
 
-    for (int x = 0; x < 80; x++) {
-      int sourceX = x + cropLeft;
-      lineBuffer[x] = swapRB(__builtin_bswap16(src[sourceX]));
+    for (int x = 0; x < SCREEN_W; x++) {
+      lineBuffer[x] = swapRB(__builtin_bswap16(src[x]));
     }
 
-    tft.drawRGBBitmap(0, y + offsetY, lineBuffer, 80, 1);
+    tft.drawRGBBitmap(0, y, lineBuffer, SCREEN_W, 1);
   }
 }
 
@@ -1379,7 +1493,6 @@ void updateCameraPreview() {
 
   if (messageUntilMs && now > messageUntilMs) {
     messageUntilMs = 0;
-    drawHeader("Camera");
   }
 }
 
@@ -1424,6 +1537,37 @@ bool writeBuffered(fs::File &file, const uint8_t *data, size_t len, size_t *tota
 
     offset += chunk;
     yield();
+  }
+
+  return true;
+}
+
+bool writeJpegToSD(const char *photoPath, const uint8_t *jpegData, size_t jpegLen, size_t *savedBytes) {
+  if (!jpegData || jpegLen == 0) return false;
+
+  fs::File photoFile = SD_MMC.open(photoPath, FILE_WRITE, true);
+  if (!photoFile) {
+    Serial.printf("Falha ao abrir %s para escrita JPEG.\n", photoPath);
+    return false;
+  }
+
+  size_t writtenTotal = 0;
+  bool ok = writeBuffered(photoFile, jpegData, jpegLen, &writtenTotal);
+  photoFile.flush();
+  photoFile.close();
+
+  if (savedBytes) *savedBytes = writtenTotal;
+
+  fs::File verifyFile = SD_MMC.open(photoPath, FILE_READ);
+  size_t verifySize = verifyFile ? verifyFile.size() : 0;
+  if (verifyFile) verifyFile.close();
+
+  Serial.printf("Verificacao JPEG %s: escrito=%u salvo=%u esperado=%u\n",
+                photoPath, (unsigned)writtenTotal, (unsigned)verifySize, (unsigned)jpegLen);
+
+  if (!ok || writtenTotal != jpegLen || verifySize != jpegLen) {
+    SD_MMC.remove(photoPath);
+    return false;
   }
 
   return true;
@@ -1521,8 +1665,9 @@ bool captureAndSavePhoto() {
   showCaptureAnimation();
   logHeap("antes-captura");
 
-  if (!initializeCamera(CAMERA_PREVIEW_RGB565)) {
+  if (!initializeCamera(CAMERA_CAPTURE_JPEG)) {
     showStatus("Falha camera", COLOR_BAD, 1200);
+    initializeCamera(CAMERA_PREVIEW_RGB565);
     drawCameraScreen();
     return false;
   }
@@ -1536,46 +1681,27 @@ bool captureAndSavePhoto() {
   digitalWrite(FLASH_PIN, LOW);
 
   if (!fb) {
-    Serial.println("Falha ao obter framebuffer RGB565 para foto.");
+    Serial.println("Falha ao obter framebuffer JPEG para foto.");
     showStatus("Falha camera", COLOR_BAD, 1200);
+    initializeCamera(CAMERA_PREVIEW_RGB565);
     drawCameraScreen();
     return false;
   }
 
-  if (fb->format != PIXFORMAT_RGB565 || fb->len == 0) {
+  if (fb->format != PIXFORMAT_JPEG || fb->len == 0) {
     Serial.printf("Framebuffer invalido para foto. formato=%d len=%u\n", fb->format, (unsigned)fb->len);
     esp_camera_fb_return(fb);
-    showStatus("Frame invalido", COLOR_BAD, 1200);
+    showStatus("JPEG invalido", COLOR_BAD, 1200);
+    initializeCamera(CAMERA_PREVIEW_RGB565);
     drawCameraScreen();
     return false;
   }
 
-  size_t frameCopyLen = fb->len;
-  uint8_t *frameCopy = (uint8_t *)heap_caps_malloc(frameCopyLen, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (!frameCopy) {
-    frameCopy = (uint8_t *)heap_caps_malloc(frameCopyLen, MALLOC_CAP_8BIT);
-  }
-
-  if (!frameCopy) {
-    Serial.printf("Sem memoria para copiar frame: %u bytes\n", (unsigned)frameCopyLen);
-    esp_camera_fb_return(fb);
-    showStatus("Memoria baixa", COLOR_BAD, 1200);
-    drawCameraScreen();
-    return false;
-  }
-
-  memcpy(frameCopy, fb->buf, frameCopyLen);
-  esp_camera_fb_return(fb);
-
-  Serial.printf("Frame RGB565 copiado: %u bytes\n", (unsigned)frameCopyLen);
-
-  Serial.println("Pausando camera para gravar no SD.");
-  desligarCamera();
-  delay(80);
+  Serial.printf("JPEG capturado: %ux%u %u bytes\n", (unsigned)fb->width, (unsigned)fb->height, (unsigned)fb->len);
   showStatus("Salvando SD", COLOR_TEXT, 500);
 
   if (!beginSDSession()) {
-    free(frameCopy);
+    esp_camera_fb_return(fb);
     showStatus("SD nao encontrado", COLOR_WARN, 1400);
     initializeCamera(CAMERA_PREVIEW_RGB565);
     drawCameraScreen();
@@ -1595,21 +1721,20 @@ bool captureAndSavePhoto() {
       uint64_t total = SD_MMC.totalBytes();
       uint64_t used = SD_MMC.usedBytes();
       uint64_t freeBytes = total > used ? total - used : 0;
-      const size_t expectedBmpSize = BMP_HEADER_SIZE + PHOTO_W * PHOTO_H * 3;
       Serial.printf("SD pronto para escrita. Total=%llu Usado=%llu Livre=%llu Arquivo=%s Tamanho=%u\n",
-                    total, used, freeBytes, photoPath, (unsigned)expectedBmpSize);
+                    total, used, freeBytes, photoPath, (unsigned)fb->len);
 
-      if (freeBytes > 0 && freeBytes < expectedBmpSize + 4096) {
+      if (freeBytes > 0 && freeBytes < fb->len + 4096) {
         Serial.println("Espaco insuficiente no SD.");
         showStatus("Espaco insuf.", COLOR_BAD, 1400);
       } else {
         size_t savedBytes = 0;
-        if (writeBmpFromPreviewFrame(photoPath, frameCopy, frameCopyLen, &savedBytes)) {
-          Serial.printf("Foto BMP salva: %s (%u bytes)\n", photoPath, (unsigned)savedBytes);
+        if (writeJpegToSD(photoPath, fb->buf, fb->len, &savedBytes)) {
+          Serial.printf("Foto JPEG salva: %s (%u bytes)\n", photoPath, (unsigned)savedBytes);
           nextPhotoNumber++;
           ok = true;
         } else {
-          Serial.println("Falha ao salvar BMP.");
+          Serial.println("Falha ao salvar JPEG.");
           showStatus("Erro salvar", COLOR_BAD, 1400);
         }
       }
@@ -1617,7 +1742,7 @@ bool captureAndSavePhoto() {
   }
 
   endSDSession();
-  free(frameCopy);
+  esp_camera_fb_return(fb);
   initializeCamera(CAMERA_PREVIEW_RGB565);
   drawCameraScreen();
 
@@ -1908,8 +2033,13 @@ void enterDeepSleep() {
   appState = STATE_SHUTDOWN;
 
   tft.fillScreen(COLOR_BG);
-  centerText("Desligando...", 70, COLOR_WARN, 1);
+  centerText("Desligando...", 36, COLOR_WARN, 1);
   delay(250);
+
+  Serial.println("Entrando em deep sleep. Acorda pelo GPIO2 em nivel baixo (botao OK/FOTO).");
+  Serial.flush();
+  Serial.end();
+  delay(30);
 
   digitalWrite(FLASH_PIN, LOW);
   desligarCamera();
@@ -1922,9 +2052,8 @@ void enterDeepSleep() {
   tft.fillScreen(COLOR_BG);
   tft.enableDisplay(false);
   backlightOff();
-
-  Serial.println("Entrando em deep sleep. Acorda pelo GPIO2 em nivel baixo (botao OK/FOTO).");
-  Serial.flush();
+  gpio_hold_en((gpio_num_t)TFT_BL);
+  gpio_deep_sleep_hold_en();
 
   rtc_gpio_pullup_en((gpio_num_t)BUTTON_ADC_PIN);
   rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_ADC_PIN);
@@ -1933,6 +2062,8 @@ void enterDeepSleep() {
 }
 
 void initializeDisplay() {
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)TFT_BL);
   pinMode(TFT_BL, OUTPUT);
   backlightOn();
 
@@ -1941,7 +2072,7 @@ void initializeDisplay() {
   tft.setSPISpeed(40000000);
   tft.invertDisplay(false);
   tft.enableDisplay(true);
-  tft.setRotation(2);
+  tft.setRotation(TFT_APP_ROTATION);
   tft.fillScreen(ST77XX_BLACK);
 }
 

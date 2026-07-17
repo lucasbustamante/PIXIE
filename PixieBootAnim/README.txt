@@ -2,7 +2,8 @@ PixieCam - ESP32-CAM AI Thinker + ST7735 0.96
 ================================================
 
 Projeto de camera fotografica digital com ESP32-CAM, display TFT ST7735
-80x160, botoes fisicos por ladder analogico e armazenamento JPEG em microSD.
+160x80 em landscape, botoes fisicos por ladder analogico e armazenamento JPEG
+em microSD.
 
 Arquivos do projeto
 -------------------
@@ -119,6 +120,21 @@ voce quiser voltar a verificar o SD durante a inicializacao, troque para:
 Se o seu hardware usar outro display ou um modulo SD externo em pinos livres,
 ajuste os defines de pinos no inicio do PixieBootAnim.ino.
 
+Orientacao da tela
+------------------
+
+O projeto agora usa o display em landscape, virado para a direita:
+
+- TFT_APP_ROTATION 3
+- SCREEN_W 160
+- SCREEN_H 80
+
+Se no seu hardware a tela ficar de cabeca para baixo, altere somente:
+
+- TFT_APP_ROTATION 1
+
+O restante da interface ja foi redesenhado para 160x80.
+
 Fluxo de inicializacao
 ----------------------
 
@@ -212,25 +228,32 @@ de desenvolvedor editavel no define PROJECT_DEVELOPER.
 Captura e armazenamento
 -----------------------
 
-O preview usa RGB565 QQVGA para manter fluidez no display. Na hora de tirar
-foto, o codigo copia esse mesmo framebuffer RGB565 e salva um BMP 24-bit
-simples com a area central do preview. Essa versao nao usa JPEG, porque a
-gravacao por SD_MMC no ESP32 e mais estavel quando escrevemos blocos pequenos
-em DRAM/DMA.
+A camera usa dois modos:
 
-Durante a gravacao, a camera e pausada por alguns instantes para liberar
-recursos internos do ESP32-CAM para o SD_MMC; depois ela e reiniciada
-automaticamente para o preview.
+- Preview: RGB565 em QQVGA, rapido e leve para o display 160x80.
+- Captura: JPEG em alta resolucao somente no momento de salvar no SD.
 
-A escrita no SD usa um buffer global DMA de 512 bytes. Depois de fechar o
-arquivo, o codigo reabre a foto e confere o tamanho salvo antes de mostrar a
-confirmacao.
+Assim o display pode ficar com qualidade baixa e fluida, enquanto o arquivo
+salvo no SD usa a melhor qualidade possivel para a placa.
+
+Resolucao:
+
+- Com PSRAM, o codigo tenta salvar em UXGA 1600x1200 e cai para SXGA, XGA,
+  SVGA, VGA ou QVGA se a placa nao aceitar.
+- Sem PSRAM, tenta QVGA e depois QQVGA.
+
+O preview volta automaticamente para RGB565 depois da captura.
+
+A escrita no SD usa um buffer global DMA de 512 bytes. O codigo copia o JPEG
+em blocos pequenos para esse buffer antes de gravar, evitando gravacao direta
+do framebuffer em PSRAM pelo SD_MMC. Depois de fechar o arquivo, ele reabre a
+foto e confere o tamanho salvo antes de mostrar a confirmacao.
 
 Nomes de arquivo:
 
-- /DCIM/PHOTO_0001.bmp
-- /DCIM/PHOTO_0002.bmp
-- /DCIM/PHOTO_0003.bmp
+- /DCIM/PHOTO_0001.jpg
+- /DCIM/PHOTO_0002.jpg
+- /DCIM/PHOTO_0003.jpg
 
 Ao tirar foto ou depois de ler a galeria, o codigo procura o maior numero
 existente e define o proximo nome sem sobrescrever arquivos.
@@ -248,9 +271,9 @@ Erros tratados visualmente e no Serial:
 Galeria
 -------
 
-A Galeria le os arquivos .bmp e .jpg de /DCIM, organiza pela numeracao do nome
+A Galeria le os arquivos .jpg e .bmp de /DCIM, organiza pela numeracao do nome
 e permite navegar com UP e DOWN. A tela mostra o nome do arquivo e a posicao,
-por exemplo "Foto 2 de 15". As fotos novas sao BMP; JPG antigo continua sendo
+por exemplo "Foto 2 de 15". As fotos novas sao JPEG; BMP antigo continua sendo
 aceito para compatibilidade.
 
 Se nao houver fotos, mostra "Nenhuma foto salva". Se nao houver SD, mostra
@@ -286,6 +309,11 @@ acordar quando o botao OK/FOTO puxar o GPIO2 para baixo. Caso o seu ladder de
 botoes nao leve GPIO2 realmente a nivel baixo, ajuste o circuito ou troque a
 fonte de wakeup no codigo.
 
+O backlight esta no GPIO1, que tambem e o TX do Serial. Por isso o codigo
+encerra o Serial antes de desligar o backlight, coloca GPIO1 em LOW e usa
+gpio_hold_en() com gpio_deep_sleep_hold_en() para manter a luz apagada durante
+o deep sleep.
+
 Possiveis ajustes de display
 ----------------------------
 
@@ -296,11 +324,11 @@ Se a imagem estiver invertida, ajuste:
 
 Se as cores da galeria aparecerem trocadas, altere:
 
-- TJpgDec.setSwapBytes(true)
+- TJpgDec.setSwapBytes(false)
 
 para:
 
-- TJpgDec.setSwapBytes(false)
+- TJpgDec.setSwapBytes(true)
 
 Se o seu ST7735 nao for o modelo mini 160x80, altere:
 
@@ -317,5 +345,5 @@ arduino-cli compile --fqbn esp32:esp32:esp32cam PixieBootAnim
 
 Resultado:
 
-- Sketch: 559911 bytes de flash.
-- Variaveis globais: 46672 bytes de RAM.
+- Sketch: 564163 bytes de flash.
+- Variaveis globais: 47200 bytes de RAM.
