@@ -76,14 +76,15 @@
 #define PREVIEW_AREA_Y 12
 #define PREVIEW_AREA_H 68
 #define GALLERY_INFO_Y 66
-#define CAMERA_CAPTURE_JPEG_QUALITY 10
-#define CAMERA_PREVIEW_JPEG_QUALITY 28
-#define CAMERA_PREVIEW_FRAME_SIZE FRAMESIZE_QQVGA
-#define CAPTURE_SENSOR_SETTLE_MS 80
-#define PREVIEW_SENSOR_SETTLE_MS 20
-#define CAPTURE_TRY_ULTRA_RES 0
+#define CAMERA_CAPTURE_JPEG_QUALITY 2
+#define CAMERA_PREVIEW_JPEG_QUALITY 12
+#define CAMERA_PREVIEW_FRAME_SIZE FRAMESIZE_QVGA
+#define CAPTURE_SENSOR_SETTLE_MS 900
+#define PREVIEW_SENSOR_SETTLE_MS 35
+#define CAPTURE_WARMUP_FRAMES 2
+#define CAPTURE_TRY_ULTRA_RES 1
 #define SD_IO_BUFFER_SIZE 4096
-#define MAX_GALLERY_JPEG_BYTES 1200000
+#define MAX_GALLERY_JPEG_BYTES 5000000
 
 #define COLOR_BG       0x0000
 #define COLOR_PANEL    0x1082
@@ -193,6 +194,7 @@ int16_t jpegViewportH = SCREEN_H;
 bool captureProfileCached = false;
 framesize_t cachedCaptureFrameSize = FRAMESIZE_SVGA;
 bool cachedCaptureUsesPsram = false;
+uint8_t cachedCaptureFbCount = 1;
 framesize_t activeSensorFrameSize = CAMERA_PREVIEW_FRAME_SIZE;
 
 const unsigned long debounceDelay = 80;
@@ -201,7 +203,7 @@ const unsigned long repeatIntervalMs = 240;
 const unsigned long backHoldMs = 900;
 const unsigned long tempoSegurarPower = 3000;
 const unsigned long stuckButtonMs = 8500;
-const unsigned long cameraFrameIntervalMs = 90;
+const unsigned long cameraFrameIntervalMs = 45;
 const unsigned long menuAnimMs = 130;
 
 const char *mainMenuItems[] = {"Camera", "Configuracoes", "Galeria", "Desligar"};
@@ -524,7 +526,7 @@ ButtonEvent readButtonEvent() {
   return event;
 }
 
-camera_config_t makeCameraConfig(CameraMode mode, framesize_t frameSize, bool usePsramBuffer) {
+camera_config_t makeCameraConfig(CameraMode mode, framesize_t frameSize, bool usePsramBuffer, uint8_t fbCount) {
   camera_config_t config = {};
 
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -551,9 +553,9 @@ camera_config_t makeCameraConfig(CameraMode mode, framesize_t frameSize, bool us
   config.xclk_freq_hz = 20000000;
 
   config.frame_size = frameSize;
-  config.fb_count = 1;
+  config.fb_count = fbCount;
   config.fb_location = usePsramBuffer ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.grab_mode = fbCount > 1 ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
   config.pixel_format = PIXFORMAT_JPEG;
   config.jpeg_quality = CAMERA_CAPTURE_JPEG_QUALITY;
 
@@ -566,11 +568,24 @@ void applySensorDefaults() {
 
   s->set_vflip(s, 0);
   s->set_hmirror(s, 0);
+  s->set_colorbar(s, 0);
+  s->set_special_effect(s, 0);
   s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, 0);
   s->set_gain_ctrl(s, 1);
   s->set_exposure_ctrl(s, 1);
+  s->set_aec2(s, 1);
+  s->set_ae_level(s, 0);
+  s->set_gainceiling(s, GAINCEILING_8X);
   s->set_brightness(s, 0);
   s->set_contrast(s, 0);
+  s->set_saturation(s, 0);
+  s->set_dcw(s, 1);
+  s->set_bpc(s, 1);
+  s->set_wpc(s, 1);
+  s->set_raw_gma(s, 1);
+  s->set_lenc(s, 1);
 }
 
 const char *frameSizeName(framesize_t frameSize) {
@@ -629,6 +644,7 @@ bool setCameraFrameProfile(framesize_t frameSize, uint8_t jpegQuality,
     return false;
   }
 
+  esp_camera_return_all();
   activeSensorFrameSize = frameSize;
   cameraMode = mode;
 
@@ -675,25 +691,31 @@ bool initializeCamera(CameraMode mode) {
   struct CameraAttempt {
     framesize_t frameSize;
     bool usePsram;
+    uint8_t fbCount;
   };
 
   CameraAttempt captureAttempts[] = {
 #if CAPTURE_TRY_ULTRA_RES
-    {FRAMESIZE_UXGA, true},
-    {FRAMESIZE_SXGA, true},
+    {FRAMESIZE_UXGA, true, 2},
+    {FRAMESIZE_UXGA, true, 1},
+    {FRAMESIZE_SXGA, true, 2},
+    {FRAMESIZE_SXGA, true, 1},
 #endif
-    {FRAMESIZE_XGA, true},
-    {FRAMESIZE_SVGA, true},
-    {FRAMESIZE_VGA, true},
-    {FRAMESIZE_SVGA, false},
-    {FRAMESIZE_VGA, false},
-    {FRAMESIZE_QVGA, true},
-    {FRAMESIZE_QVGA, false},
-    {FRAMESIZE_QQVGA, false}
+    {FRAMESIZE_XGA, true, 2},
+    {FRAMESIZE_XGA, true, 1},
+    {FRAMESIZE_SVGA, true, 2},
+    {FRAMESIZE_SVGA, true, 1},
+    {FRAMESIZE_VGA, true, 2},
+    {FRAMESIZE_VGA, true, 1},
+    {FRAMESIZE_SVGA, false, 1},
+    {FRAMESIZE_VGA, false, 1},
+    {FRAMESIZE_QVGA, true, 1},
+    {FRAMESIZE_QVGA, false, 1},
+    {FRAMESIZE_QQVGA, false, 1}
   };
 
   CameraAttempt cachedCaptureAttempt[] = {
-    {cachedCaptureFrameSize, cachedCaptureUsesPsram}
+    {cachedCaptureFrameSize, cachedCaptureUsesPsram, cachedCaptureFbCount}
   };
 
   bool tryCachedFirst = captureProfileCached;
@@ -707,9 +729,10 @@ bool initializeCamera(CameraMode mode) {
       attempts = cachedCaptureAttempt;
       attemptCount = sizeof(cachedCaptureAttempt) / sizeof(cachedCaptureAttempt[0]);
       usingCachedAttempt = true;
-      Serial.printf("Usando perfil de captura memorizado: %s buffer=%s\n",
+      Serial.printf("Usando perfil de captura memorizado: %s buffer=%s fb=%u\n",
                     frameSizeName(cachedCaptureFrameSize),
-                    cachedCaptureUsesPsram ? "PSRAM" : "DRAM");
+                    cachedCaptureUsesPsram ? "PSRAM" : "DRAM",
+                    cachedCaptureFbCount);
     } else if (pass == 1 && !tryCachedFirst) {
       break;
     }
@@ -717,10 +740,12 @@ bool initializeCamera(CameraMode mode) {
     for (uint8_t i = 0; i < attemptCount; i++) {
       if (attempts[i].usePsram && !psramAvailable) continue;
 
-      camera_config_t config = makeCameraConfig(mode, attempts[i].frameSize, attempts[i].usePsram);
-      Serial.printf("Tentando camera JPEG buffer max=%s memoria=%s\n",
+      camera_config_t config = makeCameraConfig(mode, attempts[i].frameSize,
+                                                attempts[i].usePsram, attempts[i].fbCount);
+      Serial.printf("Tentando camera JPEG buffer max=%s memoria=%s fb=%u\n",
                     frameSizeName(attempts[i].frameSize),
-                    attempts[i].usePsram ? "PSRAM" : "DRAM");
+                    attempts[i].usePsram ? "PSRAM" : "DRAM",
+                    attempts[i].fbCount);
 
       esp_err_t err = esp_camera_init(&config);
 
@@ -730,6 +755,7 @@ bool initializeCamera(CameraMode mode) {
         captureProfileCached = true;
         cachedCaptureFrameSize = attempts[i].frameSize;
         cachedCaptureUsesPsram = attempts[i].usePsram;
+        cachedCaptureFbCount = attempts[i].fbCount;
 
         bool profileOk = false;
         if (mode == CAMERA_PREVIEW_JPEG) {
@@ -748,9 +774,10 @@ bool initializeCamera(CameraMode mode) {
           continue;
         }
 
-        Serial.printf("Camera inicializada em JPEG. Buffer max=%s memoria=%s\n",
+        Serial.printf("Camera inicializada em JPEG. Buffer max=%s memoria=%s fb=%u\n",
                       frameSizeName(attempts[i].frameSize),
-                      attempts[i].usePsram ? "PSRAM" : "DRAM");
+                      attempts[i].usePsram ? "PSRAM" : "DRAM",
+                      attempts[i].fbCount);
         return true;
       }
 
@@ -1784,7 +1811,17 @@ bool isExpectedCaptureSize(camera_fb_t *fb) {
 camera_fb_t *captureJpegFrameForPhoto() {
   camera_fb_t *fb = nullptr;
 
-  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+  for (uint8_t warmup = 0; warmup < CAPTURE_WARMUP_FRAMES; warmup++) {
+    fb = esp_camera_fb_get();
+    if (!fb) return nullptr;
+    Serial.printf("Aquecimento captura: %ux%u formato=%d len=%u\n",
+                  (unsigned)fb->width, (unsigned)fb->height, fb->format, (unsigned)fb->len);
+    esp_camera_fb_return(fb);
+    fb = nullptr;
+    delay(30);
+  }
+
+  for (uint8_t attempt = 0; attempt < 5; attempt++) {
     fb = esp_camera_fb_get();
     if (!fb) {
       return nullptr;

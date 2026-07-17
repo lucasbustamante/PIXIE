@@ -231,28 +231,45 @@ Captura e armazenamento
 
 A camera usa dois perfis no mesmo modo JPEG:
 
-- Preview: JPEG QQVGA, qualidade baixa, rapido e leve para o display 160x80.
-- Captura: JPEG em alta resolucao somente no momento de salvar no SD.
+- Preview: JPEG QVGA 320x240, qualidade intermediaria, reduzido para o display
+  160x80. Usa qualidade JPEG 12 para melhorar cores/detalhe sem pesar tanto no
+  desenho do TFT.
+- Captura: JPEG em alta resolucao e baixa compressao somente no momento de
+  salvar no SD. Usa qualidade JPEG 2, priorizando a foto aberta no computador.
 
-Assim o display pode ficar com qualidade baixa e fluida, enquanto o arquivo
-salvo no SD usa a melhor qualidade possivel para a placa.
+Assim o display usa uma qualidade menor que a foto salva, mas melhor que o
+preview antigo, enquanto o arquivo no SD prioriza a melhor qualidade possivel
+para a placa.
 
 Resolucao:
 
 - Com PSRAM, o codigo reserva buffer grande na inicializacao e tenta salvar em
-  XGA 1024x768, caindo para SVGA, VGA, QVGA ou QQVGA se a placa nao aceitar.
-- Para tentar UXGA 1600x1200 e SXGA 1280x1024, altere
-  CAPTURE_TRY_ULTRA_RES para 1. Isso aumenta a qualidade, mas tambem aumenta o
-  tempo para tirar e gravar a foto.
+  UXGA 1600x1200, caindo para SXGA, XGA, SVGA, VGA, QVGA ou QQVGA se a placa
+  nao aceitar. Quando couber na memoria, usa 2 framebuffers com
+  CAMERA_GRAB_LATEST para melhorar a fluidez do preview.
+- A qualidade JPEG da captura usa valor 2. No driver da camera, valores menores
+  significam menos compressao e melhor qualidade.
 - Sem PSRAM ativa, o firmware tenta SVGA/VGA em DRAM e cai para QVGA/QQVGA se
   faltar memoria. Se as fotos continuarem pequenas no computador, confirme no
   Serial que aparece "PSRAM: disponivel" e selecione AI Thinker ESP32-CAM com
   PSRAM enabled na IDE, quando essa opcao existir.
 
-O preview volta automaticamente para JPEG QQVGA depois da captura. Para evitar
+O preview volta automaticamente para JPEG QVGA depois da captura. Para evitar
 salvar uma foto pequena logo apos a troca de resolucao, o codigo descarta frames
 antigos do preview e so salva quando o framebuffer tem o tamanho esperado para
-o perfil de captura ativo.
+o perfil de captura ativo. A captura tambem espera a autoexposicao e o balanco
+de branco estabilizarem antes de salvar.
+
+Cores:
+
+- Balanco de branco automatico e ganho de AWB ficam ativos.
+- Correcao de lente, gama, pixels brancos/pretos e exposicao automatica ficam
+  ativos.
+- Saturacao, contraste e brilho ficam neutros para uma imagem mais realista.
+
+No Serial, uma captura em qualidade maxima deve mostrar algo como:
+
+JPEG capturado: 1600x1200 ... bytes
 
 A escrita no SD usa um buffer global DMA de 4096 bytes. O codigo copia o JPEG
 em blocos pequenos para esse buffer antes de gravar, evitando gravacao direta
@@ -355,5 +372,5 @@ arduino-cli compile --fqbn esp32:esp32:esp32cam PixieBootAnim
 
 Resultado:
 
-- Sketch: 569003 bytes de flash.
+- Sketch: 569431 bytes de flash.
 - Variaveis globais: 50784 bytes de RAM.
