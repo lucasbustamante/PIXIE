@@ -76,9 +76,14 @@
 #define PREVIEW_AREA_Y 12
 #define PREVIEW_AREA_H 68
 #define GALLERY_INFO_Y 66
-#define CAMERA_CAPTURE_JPEG_QUALITY 8
-#define CAMERA_PREVIEW_JPEG_QUALITY 14
-#define SD_IO_BUFFER_SIZE 512
+#define CAMERA_CAPTURE_JPEG_QUALITY 10
+#define CAMERA_PREVIEW_JPEG_QUALITY 28
+#define CAMERA_PREVIEW_FRAME_SIZE FRAMESIZE_QQVGA
+#define CAPTURE_SENSOR_SETTLE_MS 80
+#define PREVIEW_SENSOR_SETTLE_MS 20
+#define CAPTURE_TRY_ULTRA_RES 0
+#define SD_IO_BUFFER_SIZE 4096
+#define MAX_GALLERY_JPEG_BYTES 1200000
 
 #define COLOR_BG       0x0000
 #define COLOR_PANEL    0x1082
@@ -130,7 +135,7 @@ enum ButtonEventType {
 
 enum CameraMode {
   CAMERA_OFF,
-  CAMERA_PREVIEW_RGB565,
+  CAMERA_PREVIEW_JPEG,
   CAMERA_CAPTURE_JPEG
 };
 
@@ -185,6 +190,10 @@ int16_t jpegViewportX = 0;
 int16_t jpegViewportY = 0;
 int16_t jpegViewportW = SCREEN_W;
 int16_t jpegViewportH = SCREEN_H;
+bool captureProfileCached = false;
+framesize_t cachedCaptureFrameSize = FRAMESIZE_SVGA;
+bool cachedCaptureUsesPsram = false;
+framesize_t activeSensorFrameSize = CAMERA_PREVIEW_FRAME_SIZE;
 
 const unsigned long debounceDelay = 80;
 const unsigned long repeatDelayMs = 650;
@@ -192,7 +201,7 @@ const unsigned long repeatIntervalMs = 240;
 const unsigned long backHoldMs = 900;
 const unsigned long tempoSegurarPower = 3000;
 const unsigned long stuckButtonMs = 8500;
-const unsigned long cameraFrameIntervalMs = 45;
+const unsigned long cameraFrameIntervalMs = 90;
 const unsigned long menuAnimMs = 130;
 
 const char *mainMenuItems[] = {"Camera", "Configuracoes", "Galeria", "Desligar"};
@@ -545,15 +554,8 @@ camera_config_t makeCameraConfig(CameraMode mode, framesize_t frameSize, bool us
   config.fb_count = 1;
   config.fb_location = usePsramBuffer ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-
-  if (mode == CAMERA_PREVIEW_RGB565) {
-    config.pixel_format = PIXFORMAT_RGB565;
-    config.jpeg_quality = CAMERA_PREVIEW_JPEG_QUALITY;
-    config.fb_location = CAMERA_FB_IN_DRAM;
-  } else {
-    config.pixel_format = PIXFORMAT_JPEG;
-    config.jpeg_quality = CAMERA_CAPTURE_JPEG_QUALITY;
-  }
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.jpeg_quality = CAMERA_CAPTURE_JPEG_QUALITY;
 
   return config;
 }
@@ -584,17 +586,83 @@ const char *frameSizeName(framesize_t frameSize) {
   }
 }
 
+uint16_t frameSizeWidth(framesize_t frameSize) {
+  switch (frameSize) {
+    case FRAMESIZE_UXGA: return 1600;
+    case FRAMESIZE_SXGA: return 1280;
+    case FRAMESIZE_XGA: return 1024;
+    case FRAMESIZE_SVGA: return 800;
+    case FRAMESIZE_VGA: return 640;
+    case FRAMESIZE_QVGA: return 320;
+    case FRAMESIZE_QQVGA: return 160;
+    default: return 0;
+  }
+}
+
+uint16_t frameSizeHeight(framesize_t frameSize) {
+  switch (frameSize) {
+    case FRAMESIZE_UXGA: return 1200;
+    case FRAMESIZE_SXGA: return 1024;
+    case FRAMESIZE_XGA: return 768;
+    case FRAMESIZE_SVGA: return 600;
+    case FRAMESIZE_VGA: return 480;
+    case FRAMESIZE_QVGA: return 240;
+    case FRAMESIZE_QQVGA: return 120;
+    default: return 0;
+  }
+}
+
+bool setCameraFrameProfile(framesize_t frameSize, uint8_t jpegQuality,
+                           CameraMode mode, uint16_t settleMs) {
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) {
+    Serial.println("Sensor da camera indisponivel.");
+    return false;
+  }
+
+  int frameResult = s->set_framesize(s, frameSize);
+  int qualityResult = s->set_quality(s, jpegQuality);
+
+  if (frameResult != 0 || qualityResult != 0) {
+    Serial.printf("Falha ao configurar sensor: frame=%s res=%d quality=%d res=%d\n",
+                  frameSizeName(frameSize), frameResult, jpegQuality, qualityResult);
+    return false;
+  }
+
+  activeSensorFrameSize = frameSize;
+  cameraMode = mode;
+
+  if (settleMs > 0) {
+    delay(settleMs);
+  }
+
+  Serial.printf("Sensor configurado: %s qualidade=%u modo=%s\n",
+                frameSizeName(frameSize), jpegQuality,
+                mode == CAMERA_CAPTURE_JPEG ? "captura" : "preview");
+  return true;
+}
+
 bool initializeCamera(CameraMode mode) {
   if (mode == CAMERA_OFF) {
     desligarCamera();
     return true;
   }
 
-  if (cameraLigada && cameraMode == mode) {
-    return true;
-  }
-
   if (cameraLigada) {
+    if (mode == CAMERA_CAPTURE_JPEG && cameraMode == CAMERA_PREVIEW_JPEG && captureProfileCached) {
+      if (setCameraFrameProfile(cachedCaptureFrameSize, CAMERA_CAPTURE_JPEG_QUALITY,
+                                CAMERA_CAPTURE_JPEG, CAPTURE_SENSOR_SETTLE_MS)) {
+        return true;
+      }
+      Serial.println("Perfil de captura memorizado falhou; reinicializando camera.");
+      captureProfileCached = false;
+    } else if (mode == CAMERA_PREVIEW_JPEG && cameraMode == CAMERA_CAPTURE_JPEG) {
+      return setCameraFrameProfile(CAMERA_PREVIEW_FRAME_SIZE, CAMERA_PREVIEW_JPEG_QUALITY,
+                                   CAMERA_PREVIEW_JPEG, PREVIEW_SENSOR_SETTLE_MS);
+    } else if (cameraMode == mode) {
+      return true;
+    }
+
     esp_camera_deinit();
     cameraLigada = false;
     cameraMode = CAMERA_OFF;
@@ -609,56 +677,97 @@ bool initializeCamera(CameraMode mode) {
     bool usePsram;
   };
 
-  CameraAttempt previewAttempts[] = {
-    {FRAMESIZE_QQVGA, false}
-  };
-
   CameraAttempt captureAttempts[] = {
+#if CAPTURE_TRY_ULTRA_RES
     {FRAMESIZE_UXGA, true},
     {FRAMESIZE_SXGA, true},
+#endif
     {FRAMESIZE_XGA, true},
     {FRAMESIZE_SVGA, true},
     {FRAMESIZE_VGA, true},
+    {FRAMESIZE_SVGA, false},
+    {FRAMESIZE_VGA, false},
     {FRAMESIZE_QVGA, true},
     {FRAMESIZE_QVGA, false},
     {FRAMESIZE_QQVGA, false}
   };
 
-  CameraAttempt *attempts = mode == CAMERA_CAPTURE_JPEG ? captureAttempts : previewAttempts;
-  uint8_t attemptCount = mode == CAMERA_CAPTURE_JPEG ?
-                         sizeof(captureAttempts) / sizeof(captureAttempts[0]) :
-                         sizeof(previewAttempts) / sizeof(previewAttempts[0]);
+  CameraAttempt cachedCaptureAttempt[] = {
+    {cachedCaptureFrameSize, cachedCaptureUsesPsram}
+  };
 
-  for (uint8_t i = 0; i < attemptCount; i++) {
-    if (attempts[i].usePsram && !psramAvailable) continue;
+  bool tryCachedFirst = captureProfileCached;
 
-    camera_config_t config = makeCameraConfig(mode, attempts[i].frameSize, attempts[i].usePsram);
-    Serial.printf("Tentando camera %s %s buffer=%s\n",
-                  mode == CAMERA_CAPTURE_JPEG ? "JPEG" : "RGB565",
-                  frameSizeName(attempts[i].frameSize),
-                  attempts[i].usePsram ? "PSRAM" : "DRAM");
+  for (uint8_t pass = 0; pass < 2; pass++) {
+    CameraAttempt *attempts = captureAttempts;
+    uint8_t attemptCount = sizeof(captureAttempts) / sizeof(captureAttempts[0]);
+    bool usingCachedAttempt = false;
 
-    esp_err_t err = esp_camera_init(&config);
-
-    if (err == ESP_OK) {
-      applySensorDefaults();
-      cameraLigada = true;
-      cameraMode = mode;
-      Serial.printf("Camera inicializada em %s %s buffer=%s\n",
-                    mode == CAMERA_CAPTURE_JPEG ? "JPEG" : "RGB565",
-                    frameSizeName(attempts[i].frameSize),
-                    attempts[i].usePsram ? "PSRAM" : "DRAM");
-      return true;
+    if (pass == 0 && tryCachedFirst) {
+      attempts = cachedCaptureAttempt;
+      attemptCount = sizeof(cachedCaptureAttempt) / sizeof(cachedCaptureAttempt[0]);
+      usingCachedAttempt = true;
+      Serial.printf("Usando perfil de captura memorizado: %s buffer=%s\n",
+                    frameSizeName(cachedCaptureFrameSize),
+                    cachedCaptureUsesPsram ? "PSRAM" : "DRAM");
+    } else if (pass == 1 && !tryCachedFirst) {
+      break;
     }
 
-    Serial.printf("Falha ao inicializar camera %s %s: 0x%x\n",
-                  mode == CAMERA_CAPTURE_JPEG ? "JPEG" : "RGB565",
-                  frameSizeName(attempts[i].frameSize), err);
-    esp_camera_deinit();
-    digitalWrite(PWDN_GPIO_NUM, HIGH);
-    delay(80);
-    digitalWrite(PWDN_GPIO_NUM, LOW);
-    delay(80);
+    for (uint8_t i = 0; i < attemptCount; i++) {
+      if (attempts[i].usePsram && !psramAvailable) continue;
+
+      camera_config_t config = makeCameraConfig(mode, attempts[i].frameSize, attempts[i].usePsram);
+      Serial.printf("Tentando camera JPEG buffer max=%s memoria=%s\n",
+                    frameSizeName(attempts[i].frameSize),
+                    attempts[i].usePsram ? "PSRAM" : "DRAM");
+
+      esp_err_t err = esp_camera_init(&config);
+
+      if (err == ESP_OK) {
+        applySensorDefaults();
+        cameraLigada = true;
+        captureProfileCached = true;
+        cachedCaptureFrameSize = attempts[i].frameSize;
+        cachedCaptureUsesPsram = attempts[i].usePsram;
+
+        bool profileOk = false;
+        if (mode == CAMERA_PREVIEW_JPEG) {
+          profileOk = setCameraFrameProfile(CAMERA_PREVIEW_FRAME_SIZE, CAMERA_PREVIEW_JPEG_QUALITY,
+                                            CAMERA_PREVIEW_JPEG, PREVIEW_SENSOR_SETTLE_MS);
+        } else {
+          profileOk = setCameraFrameProfile(cachedCaptureFrameSize, CAMERA_CAPTURE_JPEG_QUALITY,
+                                            CAMERA_CAPTURE_JPEG, CAPTURE_SENSOR_SETTLE_MS);
+        }
+
+        if (!profileOk) {
+          esp_camera_deinit();
+          cameraLigada = false;
+          cameraMode = CAMERA_OFF;
+          captureProfileCached = false;
+          continue;
+        }
+
+        Serial.printf("Camera inicializada em JPEG. Buffer max=%s memoria=%s\n",
+                      frameSizeName(attempts[i].frameSize),
+                      attempts[i].usePsram ? "PSRAM" : "DRAM");
+        return true;
+      }
+
+      Serial.printf("Falha ao inicializar camera JPEG %s: 0x%x\n",
+                    frameSizeName(attempts[i].frameSize), err);
+      esp_camera_deinit();
+
+      digitalWrite(PWDN_GPIO_NUM, HIGH);
+      delay(80);
+      digitalWrite(PWDN_GPIO_NUM, LOW);
+      delay(80);
+    }
+
+    if (usingCachedAttempt) {
+      captureProfileCached = false;
+      Serial.println("Perfil memorizado falhou; tentando outras resolucoes agora.");
+    }
   }
 
   cameraLigada = false;
@@ -668,7 +777,7 @@ bool initializeCamera(CameraMode mode) {
 }
 
 bool iniciarCamera() {
-  return initializeCamera(CAMERA_PREVIEW_RGB565);
+  return initializeCamera(CAMERA_PREVIEW_JPEG);
 }
 
 void desligarCamera() {
@@ -1150,7 +1259,7 @@ void showPhoto(int index) {
   }
 
   size_t fileSize = file.size();
-  if (fileSize == 0 || fileSize > 320000) {
+  if (fileSize == 0 || fileSize > MAX_GALLERY_JPEG_BYTES) {
     file.close();
     endSDSession();
     showCenteredMessage("JPEG invalido", "", COLOR_BAD);
@@ -1447,11 +1556,11 @@ void drawFormatConfirmation() {
 
 void showCaptureAnimation() {
   tft.drawRoundRect(8, 8, 144, 64, 4, COLOR_ACCENT);
-  delay(35);
+  delay(12);
   tft.drawRoundRect(20, 16, 120, 48, 4, COLOR_ACCENT);
-  delay(35);
+  delay(12);
   tft.fillScreen(ST77XX_WHITE);
-  delay(45);
+  delay(18);
   drawCameraScreen();
 }
 
@@ -1475,7 +1584,7 @@ void mostrarFrame(camera_fb_t *fb) {
 
 void updateCameraPreview() {
   if (appState != STATE_CAMERA) return;
-  if (!cameraLigada || cameraMode != CAMERA_PREVIEW_RGB565) return;
+  if (!cameraLigada || cameraMode != CAMERA_PREVIEW_JPEG) return;
 
   unsigned long now = millis();
   if (now - lastCameraFrameMs < cameraFrameIntervalMs) return;
@@ -1488,7 +1597,11 @@ void updateCameraPreview() {
     return;
   }
 
-  mostrarFrame(fb);
+  if (fb->format == PIXFORMAT_JPEG && fb->len > 0) {
+    drawJpegBufferToViewport(fb->buf, fb->len, 0, 0, SCREEN_W, SCREEN_H, false);
+  } else {
+    mostrarFrame(fb);
+  }
   esp_camera_fb_return(fb);
 
   if (messageUntilMs && now > messageUntilMs) {
@@ -1658,6 +1771,40 @@ bool writeBmpFromPreviewFrame(const char *photoPath, const uint8_t *rgb565Frame,
   return true;
 }
 
+bool isExpectedCaptureSize(camera_fb_t *fb) {
+  if (!fb) return false;
+
+  uint16_t expectedW = frameSizeWidth(activeSensorFrameSize);
+  uint16_t expectedH = frameSizeHeight(activeSensorFrameSize);
+  if (expectedW == 0 || expectedH == 0) return true;
+
+  return fb->width >= expectedW && fb->height >= expectedH;
+}
+
+camera_fb_t *captureJpegFrameForPhoto() {
+  camera_fb_t *fb = nullptr;
+
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      return nullptr;
+    }
+
+    if (fb->format == PIXFORMAT_JPEG && fb->len > 0 && isExpectedCaptureSize(fb)) {
+      return fb;
+    }
+
+    Serial.printf("Descartando frame de captura invalido/pequeno: %ux%u formato=%d len=%u esperado=%s\n",
+                  (unsigned)fb->width, (unsigned)fb->height, fb->format, (unsigned)fb->len,
+                  frameSizeName(activeSensorFrameSize));
+    esp_camera_fb_return(fb);
+    fb = nullptr;
+    delay(35);
+  }
+
+  return nullptr;
+}
+
 bool captureAndSavePhoto() {
   if (!sistemaLigado) return false;
 
@@ -1667,7 +1814,7 @@ bool captureAndSavePhoto() {
 
   if (!initializeCamera(CAMERA_CAPTURE_JPEG)) {
     showStatus("Falha camera", COLOR_BAD, 1200);
-    initializeCamera(CAMERA_PREVIEW_RGB565);
+    initializeCamera(CAMERA_PREVIEW_JPEG);
     drawCameraScreen();
     return false;
   }
@@ -1677,13 +1824,13 @@ bool captureAndSavePhoto() {
     delay(90);
   }
 
-  camera_fb_t *fb = esp_camera_fb_get();
+  camera_fb_t *fb = captureJpegFrameForPhoto();
   digitalWrite(FLASH_PIN, LOW);
 
   if (!fb) {
     Serial.println("Falha ao obter framebuffer JPEG para foto.");
     showStatus("Falha camera", COLOR_BAD, 1200);
-    initializeCamera(CAMERA_PREVIEW_RGB565);
+    initializeCamera(CAMERA_PREVIEW_JPEG);
     drawCameraScreen();
     return false;
   }
@@ -1692,7 +1839,7 @@ bool captureAndSavePhoto() {
     Serial.printf("Framebuffer invalido para foto. formato=%d len=%u\n", fb->format, (unsigned)fb->len);
     esp_camera_fb_return(fb);
     showStatus("JPEG invalido", COLOR_BAD, 1200);
-    initializeCamera(CAMERA_PREVIEW_RGB565);
+    initializeCamera(CAMERA_PREVIEW_JPEG);
     drawCameraScreen();
     return false;
   }
@@ -1703,7 +1850,7 @@ bool captureAndSavePhoto() {
   if (!beginSDSession()) {
     esp_camera_fb_return(fb);
     showStatus("SD nao encontrado", COLOR_WARN, 1400);
-    initializeCamera(CAMERA_PREVIEW_RGB565);
+    initializeCamera(CAMERA_PREVIEW_JPEG);
     drawCameraScreen();
     return false;
   }
@@ -1743,7 +1890,7 @@ bool captureAndSavePhoto() {
 
   endSDSession();
   esp_camera_fb_return(fb);
-  initializeCamera(CAMERA_PREVIEW_RGB565);
+  initializeCamera(CAMERA_PREVIEW_JPEG);
   drawCameraScreen();
 
   if (ok) {
@@ -1763,7 +1910,7 @@ void setAppState(AppState newState) {
 
   switch (newState) {
     case STATE_CAMERA:
-      initializeCamera(CAMERA_PREVIEW_RGB565);
+      initializeCamera(CAMERA_PREVIEW_JPEG);
       drawCameraScreen();
       break;
     case STATE_MAIN_MENU:
@@ -2105,7 +2252,7 @@ void setup() {
 
   initializeSDCard();
 
-  if (!initializeCamera(CAMERA_PREVIEW_RGB565)) {
+  if (!initializeCamera(CAMERA_PREVIEW_JPEG)) {
     showCenteredMessage("Falha camera", "ver Serial", COLOR_BAD);
     delay(1000);
   }

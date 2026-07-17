@@ -143,7 +143,8 @@ Fluxo de inicializacao
 3. Verifica PSRAM.
 4. Nao monta o SD no boot por padrao, para evitar travamento em pinos
    compartilhados.
-5. Inicializa a camera em RGB565 QQVGA para preview.
+5. Inicializa a camera em JPEG reservando buffer para foto grande e usa QQVGA
+   apenas para o preview do display.
 6. Entra na tela Camera com visualizacao em tempo real.
 
 Estados da interface
@@ -228,9 +229,9 @@ de desenvolvedor editavel no define PROJECT_DEVELOPER.
 Captura e armazenamento
 -----------------------
 
-A camera usa dois modos:
+A camera usa dois perfis no mesmo modo JPEG:
 
-- Preview: RGB565 em QQVGA, rapido e leve para o display 160x80.
+- Preview: JPEG QQVGA, qualidade baixa, rapido e leve para o display 160x80.
 - Captura: JPEG em alta resolucao somente no momento de salvar no SD.
 
 Assim o display pode ficar com qualidade baixa e fluida, enquanto o arquivo
@@ -238,13 +239,22 @@ salvo no SD usa a melhor qualidade possivel para a placa.
 
 Resolucao:
 
-- Com PSRAM, o codigo tenta salvar em UXGA 1600x1200 e cai para SXGA, XGA,
-  SVGA, VGA ou QVGA se a placa nao aceitar.
-- Sem PSRAM, tenta QVGA e depois QQVGA.
+- Com PSRAM, o codigo reserva buffer grande na inicializacao e tenta salvar em
+  XGA 1024x768, caindo para SVGA, VGA, QVGA ou QQVGA se a placa nao aceitar.
+- Para tentar UXGA 1600x1200 e SXGA 1280x1024, altere
+  CAPTURE_TRY_ULTRA_RES para 1. Isso aumenta a qualidade, mas tambem aumenta o
+  tempo para tirar e gravar a foto.
+- Sem PSRAM ativa, o firmware tenta SVGA/VGA em DRAM e cai para QVGA/QQVGA se
+  faltar memoria. Se as fotos continuarem pequenas no computador, confirme no
+  Serial que aparece "PSRAM: disponivel" e selecione AI Thinker ESP32-CAM com
+  PSRAM enabled na IDE, quando essa opcao existir.
 
-O preview volta automaticamente para RGB565 depois da captura.
+O preview volta automaticamente para JPEG QQVGA depois da captura. Para evitar
+salvar uma foto pequena logo apos a troca de resolucao, o codigo descarta frames
+antigos do preview e so salva quando o framebuffer tem o tamanho esperado para
+o perfil de captura ativo.
 
-A escrita no SD usa um buffer global DMA de 512 bytes. O codigo copia o JPEG
+A escrita no SD usa um buffer global DMA de 4096 bytes. O codigo copia o JPEG
 em blocos pequenos para esse buffer antes de gravar, evitando gravacao direta
 do framebuffer em PSRAM pelo SD_MMC. Depois de fechar o arquivo, ele reabre a
 foto e confere o tamanho salvo antes de mostrar a confirmacao.
@@ -345,5 +355,5 @@ arduino-cli compile --fqbn esp32:esp32:esp32cam PixieBootAnim
 
 Resultado:
 
-- Sketch: 564163 bytes de flash.
-- Variaveis globais: 47200 bytes de RAM.
+- Sketch: 569003 bytes de flash.
+- Variaveis globais: 50784 bytes de RAM.
