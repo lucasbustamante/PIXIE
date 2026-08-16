@@ -126,8 +126,12 @@ Orientacao da tela
 O projeto agora usa o display em landscape, virado para a direita:
 
 - TFT_APP_ROTATION 3
+- TFT_INIT_PROFILE INITR_MINI160x80_PLUGIN
 - SCREEN_W 160
 - SCREEN_H 80
+
+O perfil PLUGIN corrige a inversao de cores e os offsets do painel 0.96 com FPC
+plug-in, evitando pixels residuais nas bordas direita e inferior.
 
 Se no seu hardware a tela ficar de cabeca para baixo, altere somente:
 
@@ -139,13 +143,32 @@ Fluxo de inicializacao
 ----------------------
 
 1. Inicializa Serial, flash, backlight, display e preferencias.
-2. Exibe a animacao existente de boot exatamente a partir de boot_animation.h.
-3. Verifica PSRAM.
-4. Nao monta o SD no boot por padrao, para evitar travamento em pinos
+2. Exibe a animacao existente de boot sem inicializacao concorrente em outro
+   nucleo do ESP32.
+3. No primeiro boot, calibra CIMA, BAIXO e OK e salva os valores ADC.
+4. Inicializa a camera sequencialmente e reserva em PSRAM os maiores buffers de
+   captura que a placa aceitar.
+5. Depois da reserva, reduz somente o sensor para JPEG QQVGA. O preview abre
+   leve e a camera continua pronta para mudar a UXGA sem reinicializacao.
+6. Nao monta o SD no boot por padrao, evitando a disputa dos pinos
    compartilhados.
-5. Inicializa a camera em JPEG reservando buffer para foto grande e usa QQVGA
-   apenas para o preview do display.
-6. Entra na tela Camera com visualizacao em tempo real.
+7. Entra na tela Camera com visualizacao em tempo real.
+
+Protecao contra reinicio em ciclo
+---------------------------------
+
+Antes de reservar os buffers da camera, o firmware grava uma marca de boot na
+memoria RTC. A marca e apagada somente depois que o primeiro quadro do preview
+foi desenhado com sucesso. Se a placa reiniciar durante essa etapa, o boot
+seguinte detecta a interrupcao e ativa um perfil seguro:
+
+- Preview QQVGA, como nas versoes estaveis anteriores.
+- Captura limitada automaticamente a maior resolucao estavel ate SVGA.
+- Nenhuma inicializacao de camera em uma tarefa paralela.
+
+O modo seguro e salvo em Preferences para impedir novos ciclos de reinicio. A
+opcao Reset config apaga essa protecao junto com as demais preferencias e
+permite testar novamente o perfil UXGA depois de corrigir alimentacao ou PSRAM.
 
 Estados da interface
 --------------------
@@ -158,6 +181,7 @@ O sketch usa enum AppState:
 - STATE_SETTINGS
 - STATE_SD_INFO
 - STATE_SD_FORMAT_CONFIRM
+- STATE_RESET_CONFIRM
 - STATE_FLASH_SETTINGS
 - STATE_ABOUT
 - STATE_GALLERY
@@ -167,11 +191,11 @@ O sketch usa enum AppState:
 Controles
 ---------
 
-Os botoes sao lidos pelo GPIO2 usando os limiares existentes:
-
-- valor < 100: OK/FOTO
-- 200 a 900: DOWN
-- 900 a 3900: UP
+Os botoes sao lidos pelo GPIO2 e calibrados no primeiro boot. A tela solicita,
+em ordem, CIMA, BAIXO e OK. O firmware mede a resistencia de cada botao, valida
+se os valores sao distintos e salva os centros ADC em Preferences. Durante o
+uso, cada leitura usa a mediana de cinco amostras e seleciona o centro calibrado
+mais proximo, sem depender de limiares fixos.
 
 Comportamento:
 
@@ -182,7 +206,8 @@ Comportamento:
 - Nos menus, OK seleciona.
 - Como nao ha botao fisico dedicado de voltar, segurar OK por cerca de 900 ms
   volta para a tela anterior.
-- Ha debounce e repeticao controlada para botoes segurados.
+- UP e DOWN respondem ao pressionar, com debounce de 12 ms e repeticao
+  controlada para botoes segurados.
 - Se um botao ficar pressionado por tempo excessivo, o codigo mostra
   "Solte o botao" e ignora repeticoes.
 
@@ -196,8 +221,9 @@ Ordem:
 3. Galeria
 4. Desligar
 
-O item selecionado recebe destaque visual, borda, icone simples e transicao
-curta de selecao.
+O menu usa cabecalho de produto, assinatura PIXIE, cartao de selecao com barra
+de destaque, icones, separadores discretos e indicador lateral de posicao. A
+ordem dos itens e as funcoes permanecem inalteradas.
 
 Configuracoes
 -------------
@@ -207,7 +233,8 @@ Ordem:
 1. Cartao SD
 2. Flash
 3. Sobre
-4. Voltar
+4. Reset config
+5. Voltar
 
 Cartao SD mostra status, tipo, capacidade total, usado, livre e quantidade de
 fotos. Tambem oferece Formatar e Voltar.
@@ -226,52 +253,64 @@ apos reiniciar. O LED do flash acende apenas durante a captura.
 Sobre mostra nome do projeto, versao, plataforma, descricao curta e um campo
 de desenvolvedor editavel no define PROJECT_DEVELOPER.
 
+Reset config pede confirmacao, limpa Preferences e reinicia. No boot seguinte,
+a calibracao guiada dos tres botoes e executada novamente.
+
 Captura e armazenamento
 -----------------------
 
 A camera usa dois perfis no mesmo modo JPEG:
 
-- Preview: JPEG QVGA 320x240, qualidade intermediaria, reduzido para o display
-  160x80. Usa qualidade JPEG 12 para melhorar cores/detalhe sem pesar tanto no
-  desenho do TFT.
-- Captura: JPEG em alta resolucao e baixa compressao somente no momento de
-  salvar no SD. Usa qualidade JPEG 2, priorizando a foto aberta no computador.
+- Preview: JPEG QQVGA 160x120, qualidade intermediaria e dois framebuffers com
+  CAMERA_GRAB_LATEST quando a memoria permite. O quadro e rotacionado,
+  espelhado e recortado proporcionalmente para ocupar os 160x80 completos sem
+  achatar pessoas ou objetos.
+- Captura: JPEG em alta resolucao e compressao minima somente no momento de
+  salvar no SD. Tenta qualidade JPEG 0, o melhor valor aceito pelo driver, e
+  usa qualidade 2 apenas se o quadro maximo nao couber no buffer da placa.
 
 Assim o display usa uma qualidade menor que a foto salva, mas melhor que o
 preview antigo, enquanto o arquivo no SD prioriza a melhor qualidade possivel
 para a placa.
 
+O preview e a galeria giram a imagem da camera 90 graus para a esquerda e fazem
+o espelhamento horizontal antes de desenhar no TFT. O quadro completo e montado
+em RAM e enviado ao display de uma vez, reduzindo cintilacao e rasgos visuais.
+O JPEG salvo nao e recodificado.
+
 Resolucao:
 
-- Com PSRAM, o codigo reserva buffer grande na inicializacao e tenta salvar em
-  UXGA 1600x1200, caindo para SXGA, XGA, SVGA, VGA, QVGA ou QQVGA se a placa
-  nao aceitar. Quando couber na memoria, usa 2 framebuffers com
-  CAMERA_GRAB_LATEST para melhorar a fluidez do preview.
-- A qualidade JPEG da captura usa valor 2. No driver da camera, valores menores
-  significam menos compressao e melhor qualidade.
+- Com PSRAM, o boot tenta reservar 2 framebuffers UXGA 1600x1200. Se nao
+  couberem, tenta 1 buffer UXGA e depois SXGA, XGA, SVGA, VGA, QVGA ou QQVGA.
+- A qualidade JPEG da captura usa valor 0. No driver da camera, valores menores
+  significam menos compressao e melhor qualidade. Se a cena gerar um JPEG
+  maior que o buffer, o firmware repete automaticamente em qualidade 2.
 - Sem PSRAM ativa, o firmware tenta SVGA/VGA em DRAM e cai para QVGA/QQVGA se
   faltar memoria. Se as fotos continuarem pequenas no computador, confirme no
   Serial que aparece "PSRAM: disponivel" e selecione AI Thinker ESP32-CAM com
   PSRAM enabled na IDE, quando essa opcao existir.
 
-O preview volta automaticamente para JPEG QVGA depois da captura. Para evitar
-salvar uma foto pequena logo apos a troca de resolucao, o codigo descarta frames
-antigos do preview e so salva quando o framebuffer tem o tamanho esperado para
-o perfil de captura ativo. A captura tambem espera a autoexposicao e o balanco
-de branco estabilizarem antes de salvar.
+O preview volta automaticamente para JPEG QQVGA depois da captura. Para evitar
+salvar uma foto pequena logo apos a troca de resolucao, o codigo le as dimensoes
+codificadas dentro do proprio JPEG e descarta qualquer quadro antigo. Nao existe
+mais espera fixa de 900 ms nem descarte obrigatorio de dois frames. A troca de
+perfil ocorre nos buffers preparados sequencialmente durante o boot, e a confirmacao visual
+do clique aparece em 6 ms.
 
 Cores:
 
 - Balanco de branco automatico e ganho de AWB ficam ativos.
 - Correcao de lente, gama, pixels brancos/pretos e exposicao automatica ficam
   ativos.
-- Saturacao, contraste e brilho ficam neutros para uma imagem mais realista.
+- Brilho e nivel de autoexposicao usam +1 para clarear o preview.
+- O AEC secundario fica desativado para reduzir oscilacao de luminosidade.
+- Saturacao e contraste ficam neutros.
 
 No Serial, uma captura em qualidade maxima deve mostrar algo como:
 
 JPEG capturado: 1600x1200 ... bytes
 
-A escrita no SD usa um buffer global DMA de 4096 bytes. O codigo copia o JPEG
+A escrita no SD usa um buffer global DMA de 16384 bytes. O codigo copia o JPEG
 em blocos pequenos para esse buffer antes de gravar, evitando gravacao direta
 do framebuffer em PSRAM pelo SD_MMC. Depois de fechar o arquivo, ele reabre a
 foto e confere o tamanho salvo antes de mostrar a confirmacao.
@@ -331,15 +370,15 @@ A selecao padrao e Nao. Ao confirmar Sim:
 5. Desliga display e backlight.
 6. Entra em deep sleep.
 
-O wakeup configurado e ext0 no GPIO2 em nivel baixo. Na pratica, isso deve
-acordar quando o botao OK/FOTO puxar o GPIO2 para baixo. Caso o seu ladder de
-botoes nao leve GPIO2 realmente a nivel baixo, ajuste o circuito ou troque a
-fonte de wakeup no codigo.
+O wakeup configurado e ext0 no GPIO2 em nivel baixo. Ele responde ao botao cujo
+circuito leva o ADC mais perto de LOW, independentemente do nome salvo durante
+a calibracao. Para acordar especificamente com OK/FOTO, esse botao precisa levar
+GPIO2 a LOW ou o projeto deve usar outra fonte de wakeup.
 
-O backlight esta no GPIO1, que tambem e o TX do Serial. Por isso o codigo
-encerra o Serial antes de desligar o backlight, coloca GPIO1 em LOW e usa
-gpio_hold_en() com gpio_deep_sleep_hold_en() para manter a luz apagada durante
-o deep sleep.
+O backlight esta no GPIO1, que tambem e o TX do Serial. Por isso
+ENABLE_SERIAL_DEBUG fica em 0 por padrao: transmissao serial nesse pino faz o
+backlight piscar. Ao desligar, o codigo coloca GPIO1 em LOW e usa gpio_hold_en()
+com gpio_deep_sleep_hold_en() para manter a luz apagada durante o deep sleep.
 
 Possiveis ajustes de display
 ----------------------------
@@ -348,6 +387,7 @@ Se a imagem estiver invertida, ajuste:
 
 - tft.setRotation(2)
 - sensor vflip/hmirror em applySensorDefaults()
+- CAMERA_DISPLAY_MIRROR_HORIZONTAL
 
 Se as cores da galeria aparecerem trocadas, altere:
 
@@ -357,9 +397,9 @@ para:
 
 - TJpgDec.setSwapBytes(true)
 
-Se o seu ST7735 nao for o modelo mini 160x80, altere:
+Se o seu ST7735 nao for o modelo mini 160x80 com FPC plug-in, altere:
 
-- tft.initR(INITR_MINI160x80)
+- TFT_INIT_PROFILE INITR_MINI160x80_PLUGIN
 
 para o inicializador correto da sua tela.
 
@@ -372,5 +412,5 @@ arduino-cli compile --fqbn esp32:esp32:esp32cam PixieBootAnim
 
 Resultado:
 
-- Sketch: 569431 bytes de flash.
-- Variaveis globais: 50784 bytes de RAM.
+- Sketch: 560143 bytes de flash.
+- Variaveis globais: 88736 bytes de RAM.
