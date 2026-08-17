@@ -17,7 +17,7 @@ Bibliotecas necessarias
 
 Instale pelo Arduino IDE em Library Manager ou pelo arduino-cli:
 
-- ESP32 Arduino core: 3.3.8 recomendado.
+- ESP32 Arduino core: 3.3.11 testado (3.3.8 ou mais novo da serie 3.x).
 - Adafruit GFX Library: 1.12.6 recomendado.
 - Adafruit ST7735 and ST7789 Library: 1.11.0 recomendado.
 - Adafruit BusIO: 1.17.4 recomendado.
@@ -105,6 +105,24 @@ logo em seguida, restaurando o barramento SPI do display. Durante leitura ou
 gravacao no SD a interface fica com uma tela de status, e depois o display e
 redesenhado.
 
+No modo SD_MMC de 1 bit, o controlador usa CLK, CMD e DAT0. Como GPIO4/DAT1
+aciona o LED de flash nessa placa, ele deve permanecer em LOW. Durante cada
+sessao, o firmware agora:
+
+- Para completamente a camera.
+- Mantem GPIO4/DAT1 rigidamente em LOW durante o SD: no modo 1-bit DAT1 nao e
+  usado e, no AI Thinker, esse pino aciona o flash.
+- Libera GPIO12/DAT2 do MOSI do TFT em alta impedancia, sem pull-up. DAT2 nao
+  participa do modo 1-bit e GPIO12 e um pino de strap sensivel do ESP32.
+- Mantem GPIO13/DAT3 ativamente alto, deixando o TFT desmarcado e o cartao em
+  modo SD.
+- Libera GPIO14/CLK, GPIO15/CMD e GPIO2/DAT0 para o controlador SD_MMC.
+- Confere se GPIO2/DAT0 realmente voltou ao nivel alto antes de iniciar o
+  controlador; se houver botao preso ou pull-down permanente, retorna erro sem
+  tentar montar o cartao.
+- Nao envia nenhum comando ao TFT enquanto o cartao estiver montado.
+- Restaura flash, botoes e barramento do display depois de desmontar o cartao.
+
 Para evitar travamento no boot em placas onde SD_MMC.begin() demora ou fica
 preso nesses pinos compartilhados, a verificacao automatica do SD ao ligar
 fica desativada por padrao:
@@ -119,6 +137,11 @@ voce quiser voltar a verificar o SD durante a inicializacao, troque para:
 
 Se o seu hardware usar outro display ou um modulo SD externo em pinos livres,
 ajuste os defines de pinos no inicio do PixieBootAnim.ino.
+
+O GPIO2/DAT0 precisa permanecer alto quando nenhum botao esta pressionado. Um
+resistor permanente para GND no ladder de botoes impede fisicamente o SD_MMC de
+funcionar. O circuito esperado e pull-up para 3,3 V e resistores para GND apenas
+enquanto um botao estiver pressionado.
 
 Orientacao da tela
 ------------------
@@ -145,7 +168,8 @@ Fluxo de inicializacao
 1. Inicializa Serial, flash, backlight, display e preferencias.
 2. Exibe a animacao existente de boot sem inicializacao concorrente em outro
    nucleo do ESP32.
-3. No primeiro boot, calibra CIMA, BAIXO e OK e salva os valores ADC.
+3. No primeiro boot de cada nova compilacao, calibra CIMA, BAIXO e OK e salva
+   os valores ADC.
 4. Inicializa a camera sequencialmente e reserva em PSRAM os maiores buffers de
    captura que a placa aceitar.
 5. Depois da reserva, reduz somente o sensor para JPEG QQVGA. O preview abre
@@ -191,11 +215,16 @@ O sketch usa enum AppState:
 Controles
 ---------
 
-Os botoes sao lidos pelo GPIO2 e calibrados no primeiro boot. A tela solicita,
-em ordem, CIMA, BAIXO e OK. O firmware mede a resistencia de cada botao, valida
-se os valores sao distintos e salva os centros ADC em Preferences. Durante o
-uso, cada leitura usa a mediana de cinco amostras e seleciona o centro calibrado
-mais proximo, sem depender de limiares fixos.
+Os botoes sao lidos pelo GPIO2 e calibrados no primeiro boot de cada nova
+compilacao. A tela solicita, em ordem, CIMA, BAIXO e OK. O firmware mede a
+resistencia de cada botao, valida se os valores sao distintos e salva os centros
+ADC em Preferences junto com uma assinatura baseada em __DATE__ e __TIME__. Ao
+compilar e gravar o sketch novamente, a assinatura muda e a calibracao guiada e
+executada de novo. Reiniciar normalmente sem regravar mantem a calibracao.
+
+Se exatamente o mesmo arquivo binario precompilado for gravado novamente, a
+assinatura tambem sera a mesma. Para garantir nova calibracao nesse caso, use
+Reset config antes de regravar ou compile o sketch novamente.
 
 Comportamento:
 
@@ -245,7 +274,17 @@ Formatar SD nao executa imediatamente. O codigo mostra confirmacao com:
 - Nao
 
 A selecao padrao e Nao. Ao confirmar Sim, o conteudo do cartao e apagado,
-/DCIM e recriado e a numeracao das fotos volta para 1.
+/DCIM e recriado e a numeracao das fotos volta para 1. Se o cartao estiver em
+exFAT ou com um sistema de arquivos que o FATFS nao consegue montar, formate-o
+primeiro em FAT32 no computador. A captura normal nunca formata nem apaga o
+cartao automaticamente.
+
+A formatacao usa a API oficial esp_vfs_fat_sdcard_format_cfg do ESP-IDF, com
+unidade de alocacao de 16 KB. Ela roda em uma tarefa dedicada com 8 KB de stack,
+enquanto o loop principal continua cedendo CPU ao sistema. Isso evita o reinicio
+por watchdog que podia ocorrer quando a operacao longa era executada dentro de
+SD_MMC.begin(). O TFT permanece sem receber comandos ate o fim da formatacao,
+pois compartilha os pinos do SD.
 
 Flash alterna entre ON e OFF. A preferencia e salva com Preferences e mantida
 apos reiniciar. O LED do flash acende apenas durante a captura.
@@ -297,6 +336,13 @@ mais espera fixa de 900 ms nem descarte obrigatorio de dois frames. A troca de
 perfil ocorre nos buffers preparados sequencialmente durante o boot, e a confirmacao visual
 do clique aparece em 6 ms.
 
+Assim que o quadro correto e capturado, o JPEG completo e copiado sem
+recodificacao para um buffer independente na PSRAM. O framebuffer e devolvido e
+a camera e totalmente desligada antes da montagem do SD. Isso interrompe o fluxo
+I2S/DMA de quadros UXGA e libera os buffers do driver, evitando concorrencia com
+o DMA do SD_MMC. Depois da gravacao, a camera e o preview sao restaurados
+automaticamente.
+
 Cores:
 
 - Balanco de branco automatico e ganho de AWB ficam ativos.
@@ -310,10 +356,15 @@ No Serial, uma captura em qualidade maxima deve mostrar algo como:
 
 JPEG capturado: 1600x1200 ... bytes
 
-A escrita no SD usa um buffer global DMA de 16384 bytes. O codigo copia o JPEG
-em blocos pequenos para esse buffer antes de gravar, evitando gravacao direta
-do framebuffer em PSRAM pelo SD_MMC. Depois de fechar o arquivo, ele reabre a
-foto e confere o tamanho salvo antes de mostrar a confirmacao.
+A escrita no SD usa um buffer global DMA de 4096 bytes, reduzindo a pressao
+sobre a RAM interna enquanto a foto de alta qualidade permanece na PSRAM. O
+SD_MMC trabalha em modo 1-bit na frequencia padrao de 20 MHz, com uma unica
+inicializacao por sessao, igual ao fluxo estavel do repositorio. O JPEG e
+escrito em blocos, fechado e reaberto para conferir o tamanho. Se a escrita
+falhar, o arquivo incompleto e removido, o firmware repete a operacao e, se
+necessario, desmonta e remonta completamente o cartao antes da ultima tentativa.
+Mensagens de erro so sao desenhadas depois que o SD foi desmontado, porque o
+TFT compartilha GPIO14 e GPIO15 com ele.
 
 Nomes de arquivo:
 
@@ -412,5 +463,5 @@ arduino-cli compile --fqbn esp32:esp32:esp32cam PixieBootAnim
 
 Resultado:
 
-- Sketch: 560143 bytes de flash.
-- Variaveis globais: 88736 bytes de RAM.
+- Sketch: 549823 bytes de flash.
+- Variaveis globais: 76464 bytes de RAM.

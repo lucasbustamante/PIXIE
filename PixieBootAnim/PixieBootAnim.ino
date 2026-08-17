@@ -4,6 +4,9 @@
 #include "esp_sleep.h"
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
+#include "esp_vfs_fat.h"
+#include "freertos/semphr.h"
+#include "vfs_api.h"
 #include <FS.h>
 #include <SD_MMC.h>
 #include <SPI.h>
@@ -89,7 +92,11 @@
 #define CAPTURE_WARMUP_FRAMES 0
 #define CAPTURE_FRAME_READY_TIMEOUT_MS 900
 #define CAPTURE_TRY_ULTRA_RES 1
-#define SD_IO_BUFFER_SIZE 16384
+#define SD_IO_BUFFER_SIZE 4096
+#define SD_MOUNT_FREQ_KHZ SDMMC_FREQ_DEFAULT
+#define SD_MAX_OPEN_FILES 5
+#define SD_FORMAT_ALLOCATION_UNIT 16384
+#define SD_FORMAT_TASK_STACK_SIZE 8192
 #define MAX_GALLERY_JPEG_BYTES 5000000
 #define CAMERA_BOOT_GUARD_MAGIC 0x50495843UL
 
@@ -107,6 +114,18 @@
 SPIClass vspi(VSPI);
 Adafruit_ST7735 tft = Adafruit_ST7735(&vspi, TFT_CS, TFT_DC, TFT_RST);
 Preferences preferences;
+
+// A classe Arduino SDMMCFS nao expoe o handle exigido pela API oficial de
+// formatacao do ESP-IDF. Esta subclasse usa exatamente a mesma implementacao,
+// mas disponibiliza o handle protegido sem alterar a biblioteca instalada.
+class PixieSDMMCFS : public fs::SDMMCFS {
+public:
+  explicit PixieSDMMCFS(fs::FSImplPtr impl) : fs::SDMMCFS(impl) {}
+  sdmmc_card_t *cardHandle() { return _card; }
+};
+
+PixieSDMMCFS pixieSD(fs::FSImplPtr(new VFSImpl()));
+#define SD_MMC pixieSD
 
 uint16_t lineBuffer[SCREEN_W];
 uint16_t previewFrameBuffer[SCREEN_W * SCREEN_H];
@@ -236,6 +255,7 @@ const unsigned long menuAnimMs = 130;
 
 const char *mainMenuItems[] = {"Camera", "Configuracoes", "Galeria", "Desligar"};
 const char *settingsItems[] = {"Cartao SD", "Flash", "Sobre", "Reset config", "Voltar"};
+const char firmwareBuildId[] = __DATE__ " " __TIME__;
 
 // Prototipos principais
 void initializeDisplay();
@@ -361,6 +381,8 @@ void backlightOff() {
 }
 
 void restoreDisplayBus() {
+  pinMode(FLASH_PIN, OUTPUT);
+  digitalWrite(FLASH_PIN, LOW);
   pinMode(TFT_CS, OUTPUT);
   pinMode(TFT_DC, OUTPUT);
   pinMode(TFT_RST, OUTPUT);
@@ -373,14 +395,31 @@ void restoreDisplayBus() {
 }
 
 void prepareSharedPinsForSD() {
+  // No modo SD de 1 bit apenas CLK, CMD e DAT0 sao usados pelo barramento;
+  // DAT3 deve permanecer alto. D1 e D2 nao participam da transferencia.
+  // No AI Thinker, GPIO4/DAT1 tambem aciona o LED de flash: ele precisa
+  // continuar como saida LOW para nao causar pico de corrente.
+  digitalWrite(FLASH_PIN, LOW);
   digitalWrite(TFT_CS, HIGH);
   vspi.end();
 
-  // GPIO14/15/2 pertencem ao SD interno em modo 1-bit. Como tambem sao usados
-  // pelo TFT/botoes, deixe-os livres antes de chamar SD_MMC.begin().
+  pinMode(TFT_CS, OUTPUT);
+  digitalWrite(TFT_CS, HIGH);
+  pinMode(FLASH_PIN, OUTPUT);
+  digitalWrite(FLASH_PIN, LOW);
+  gpio_set_level((gpio_num_t)FLASH_PIN, 0);
+
+  // GPIO12 e o pino de strap da tensao do flash do ESP32 e nao e usado no
+  // SD_MMC de 1 bit. Deixe-o em alta impedancia, sem forcar pull-up.
+  pinMode(TFT_MOSI, INPUT);
   pinMode(TFT_SCLK, INPUT_PULLUP);
   pinMode(TFT_DC, INPUT_PULLUP);
   pinMode(BUTTON_ADC_PIN, INPUT_PULLUP);
+
+  gpio_pulldown_dis((gpio_num_t)TFT_DC);
+  gpio_pulldown_dis((gpio_num_t)BUTTON_ADC_PIN);
+  gpio_pullup_en((gpio_num_t)TFT_DC);
+  gpio_pullup_en((gpio_num_t)BUTTON_ADC_PIN);
   delay(20);
 }
 
@@ -568,7 +607,22 @@ bool calibratedButtonCentersAreValid() {
          adcDistance(buttonAdcIdle, buttonAdcOk) >= minimumSeparation;
 }
 
+uint32_t firmwareBuildSignature() {
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; firmwareBuildId[i] != 0; i++) {
+    hash ^= (uint8_t)firmwareBuildId[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
 void loadButtonCalibration() {
+  uint32_t storedBuild = preferences.getUInt("btn_build", 0);
+  if (storedBuild != firmwareBuildSignature()) {
+    buttonCalibrationValid = false;
+    return;
+  }
+
   buttonCalibrationValid = preferences.getBool("btn_cal", false);
   if (!buttonCalibrationValid) return;
 
@@ -612,6 +666,7 @@ void runButtonCalibration() {
   preferences.putUShort("btn_up", buttonAdcUp);
   preferences.putUShort("btn_down", buttonAdcDown);
   preferences.putUShort("btn_ok", buttonAdcOk);
+  preferences.putUInt("btn_build", firmwareBuildSignature());
   preferences.putBool("btn_cal", true);
   buttonCalibrationValid = true;
 
@@ -1095,7 +1150,24 @@ void desligarCamera() {
 bool beginSDSession(bool quiet = false) {
   if (sdMounted) return true;
 
+  // O controlador da camera permanece produzindo quadros mesmo fora da tela
+  // Camera. Pare-o antes de qualquer acesso ao SD para nao disputar DMA/RAM.
+  if (cameraLigada) {
+    desligarCamera();
+    delay(20);
+  }
+
   prepareSharedPinsForSD();
+
+  // GPIO2 e simultaneamente DAT0 e a entrada do ladder de botoes. Se a linha
+  // continuar baixa mesmo com pull-up, nao entregue o pino ao controlador:
+  // isso indica botao preso ou pull-down permanente e evita travar o driver.
+  if (digitalRead(BUTTON_ADC_PIN) == LOW) {
+    if (!quiet) Serial.println("GPIO2/DAT0 esta baixo; solte os botoes e verifique o ladder.");
+    sdAvailable = false;
+    restoreDisplayBus();
+    return false;
+  }
 
   bool pinsOk = SD_MMC.setPins(SD_MMC_CLK_PIN, SD_MMC_CMD_PIN, SD_MMC_D0_PIN);
   if (!pinsOk) {
@@ -1105,7 +1177,19 @@ bool beginSDSession(bool quiet = false) {
     return false;
   }
 
-  bool mounted = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 5);
+  // Use a mesma inicializacao simples e estavel do firmware funcional do
+  // repositorio: uma unica montagem, modo 1-bit e frequencia padrao de 20 MHz.
+  // Evitar varias inicializacoes seguidas tambem evita estados incompletos do
+  // host SDMMC depois de uma falha de comunicacao.
+  Serial.printf("Montando SD_MMC 1-bit em %u kHz.\n", (unsigned)SD_MOUNT_FREQ_KHZ);
+  bool mounted = SD_MMC.begin("/sdcard", true, false,
+                              SD_MOUNT_FREQ_KHZ, SD_MAX_OPEN_FILES);
+
+  // O driver de 1 bit nao usa DAT1; mantenha o flash apagado durante todo o IO.
+  pinMode(FLASH_PIN, OUTPUT);
+  digitalWrite(FLASH_PIN, LOW);
+  gpio_set_level((gpio_num_t)FLASH_PIN, 0);
+
   if (!mounted) {
     if (!quiet) Serial.println("Cartao SD nao encontrado ou falha de montagem.");
     sdAvailable = false;
@@ -1251,66 +1335,76 @@ void formatBytes(uint64_t bytes, char *out, size_t outSize) {
   }
 }
 
-bool deleteRecursive(const char *path, bool removeSelf) {
-  fs::File root = SD_MMC.open(path);
-  if (!root) {
-    Serial.printf("Nao abriu para remover: %s\n", path);
+struct SDFormatJob {
+  SemaphoreHandle_t finished;
+  esp_err_t result;
+};
+
+void formatSDWorker(void *parameter) {
+  SDFormatJob *job = static_cast<SDFormatJob *>(parameter);
+  esp_vfs_fat_mount_config_t formatConfig = {};
+  formatConfig.format_if_mount_failed = false;
+  formatConfig.max_files = SD_MAX_OPEN_FILES;
+  formatConfig.allocation_unit_size = SD_FORMAT_ALLOCATION_UNIT;
+  formatConfig.disk_status_check_enable = false;
+  formatConfig.use_one_fat = false;
+
+  job->result = esp_vfs_fat_sdcard_format_cfg("/sdcard", SD_MMC.cardHandle(),
+                                               &formatConfig);
+  xSemaphoreGive(job->finished);
+  vTaskDelete(nullptr);
+}
+
+bool formatMountedSDCard() {
+  if (!sdMounted || !SD_MMC.cardHandle()) return false;
+
+  SDFormatJob job = {};
+  job.finished = xSemaphoreCreateBinary();
+  job.result = ESP_FAIL;
+  if (!job.finished) {
+    Serial.println("Sem memoria para iniciar formatacao do SD.");
     return false;
   }
 
-  bool ok = true;
+  TaskHandle_t formatTask = nullptr;
+  BaseType_t created = xTaskCreatePinnedToCore(
+    formatSDWorker, "pixie_sd_format", SD_FORMAT_TASK_STACK_SIZE,
+    &job, 1, &formatTask, 0
+  );
 
-  if (!root.isDirectory()) {
-    root.close();
-    return SD_MMC.remove(path);
+  if (created != pdPASS) {
+    Serial.println("Falha ao criar tarefa de formatacao do SD.");
+    vSemaphoreDelete(job.finished);
+    return false;
   }
 
-  fs::File file = root.openNextFile();
-  while (file) {
-    char childPath[96];
-    const char *name = file.name();
-    if (name[0] == '/') {
-      copyText(childPath, name, sizeof(childPath));
-    } else {
-      snprintf(childPath, sizeof(childPath), "%s/%s", path, name);
-    }
-
-    bool isDir = file.isDirectory();
-    file.close();
-
-    if (isDir) {
-      if (!deleteRecursive(childPath, true)) ok = false;
-    } else {
-      Serial.printf("Removendo arquivo %s\n", childPath);
-      if (!SD_MMC.remove(childPath)) ok = false;
-    }
-
-    file = root.openNextFile();
-    yield();
+  // O TFT permanece intocado enquanto a tarefa usa os pinos compartilhados.
+  // A espera curta devolve CPU ao sistema e evita watchdog durante cartoes
+  // grandes ou lentos.
+  while (xSemaphoreTake(job.finished, pdMS_TO_TICKS(50)) != pdTRUE) {
+    delay(1);
   }
 
-  root.close();
-
-  if (removeSelf && strcmp(path, "/") != 0) {
-    Serial.printf("Removendo pasta %s\n", path);
-    if (!SD_MMC.rmdir(path)) ok = false;
-  }
-
-  return ok;
+  vSemaphoreDelete(job.finished);
+  Serial.printf("Resultado da formatacao FAT: %s (0x%x)\n",
+                esp_err_to_name(job.result), (unsigned)job.result);
+  return job.result == ESP_OK;
 }
 
 bool formatSDCard() {
   showCenteredMessage("Formatando...", "Aguarde", COLOR_WARN);
   Serial.println("Apagando conteudo do cartao SD.");
 
-  if (!beginSDSession()) {
-    showCenteredMessage("SD nao encontrado", "", COLOR_BAD);
+  // Monte primeiro sem formatacao automatica. O caminho antigo executava uma
+  // operacao longa dentro de SD_MMC.begin() e podia reiniciar o dispositivo.
+  if (!beginSDSession(false)) {
+    showCenteredMessage("Use SD FAT32", "Nao foi montado", COLOR_BAD);
     return false;
   }
 
-  bool ok = deleteRecursive("/", false);
-  if (!SD_MMC.exists(DCIM_DIR)) {
-    ok = SD_MMC.mkdir(DCIM_DIR) && ok;
+  bool ok = formatMountedSDCard();
+  if (ok && !SD_MMC.exists(DCIM_DIR)) {
+    ok = SD_MMC.mkdir(DCIM_DIR);
   }
 
   nextPhotoNumber = 1;
@@ -1840,27 +1934,35 @@ void drawSettingsMenu() {
 }
 
 void drawSDInfo() {
-  tft.fillScreen(COLOR_BG);
-  drawHeader("Cartao SD");
+  bool cardReady = false;
+  uint8_t type = CARD_NONE;
+  uint16_t storedPhotos = 0;
+  char totalText[18] = "-";
+  char usedText[18] = "-";
+  char freeText[18] = "-";
 
-  if (!beginSDSession(true)) {
-    tft.setTextSize(1);
-    centerText("SD nao encontrado", 38, COLOR_WARN, 1);
-  } else {
+  if (beginSDSession(true)) {
     uint64_t total = SD_MMC.totalBytes();
     uint64_t used = SD_MMC.usedBytes();
     uint64_t freeBytes = total > used ? total - used : 0;
-    uint8_t type = SD_MMC.cardType();
-    uint16_t storedPhotos = countPhotosOnMountedSD();
+    type = SD_MMC.cardType();
+    storedPhotos = countPhotosOnMountedSD();
     scanNextPhotoNumber();
-
-    char totalText[18];
-    char usedText[18];
-    char freeText[18];
     formatBytes(total, totalText, sizeof(totalText));
     formatBytes(used, usedText, sizeof(usedText));
     formatBytes(freeBytes, freeText, sizeof(freeText));
+    cardReady = true;
+    endSDSession();
+  }
 
+  // Desenhe somente depois de devolver GPIO14/15/2 ao TFT/botoes.
+  tft.fillScreen(COLOR_BG);
+  drawHeader("Cartao SD");
+
+  if (!cardReady) {
+    tft.setTextSize(1);
+    centerText("SD nao encontrado", 38, COLOR_WARN, 1);
+  } else {
     tft.setTextSize(1);
     tft.setTextColor(COLOR_TEXT);
     tft.setCursor(4, 22);
@@ -1880,8 +1982,6 @@ void drawSDInfo() {
     tft.setCursor(86, 46);
     tft.print("Fotos: ");
     tft.print(storedPhotos);
-
-    endSDSession();
   }
 
   const char *options[] = {"Formatar", "Voltar"};
@@ -2144,32 +2244,52 @@ bool writeBuffered(fs::File &file, const uint8_t *data, size_t len, size_t *tota
 bool writeJpegToSD(const char *photoPath, const uint8_t *jpegData, size_t jpegLen, size_t *savedBytes) {
   if (!jpegData || jpegLen == 0) return false;
 
-  fs::File photoFile = SD_MMC.open(photoPath, FILE_WRITE, true);
-  if (!photoFile) {
-    Serial.printf("Falha ao abrir %s para escrita JPEG.\n", photoPath);
-    return false;
-  }
-
-  size_t writtenTotal = 0;
-  bool ok = writeBuffered(photoFile, jpegData, jpegLen, &writtenTotal);
-  photoFile.flush();
-  photoFile.close();
-
-  if (savedBytes) *savedBytes = writtenTotal;
-
-  fs::File verifyFile = SD_MMC.open(photoPath, FILE_READ);
-  size_t verifySize = verifyFile ? verifyFile.size() : 0;
-  if (verifyFile) verifyFile.close();
-
-  Serial.printf("Verificacao JPEG %s: escrito=%u salvo=%u esperado=%u\n",
-                photoPath, (unsigned)writtenTotal, (unsigned)verifySize, (unsigned)jpegLen);
-
-  if (!ok || writtenTotal != jpegLen || verifySize != jpegLen) {
+  for (uint8_t attempt = 0; attempt < 2; attempt++) {
     SD_MMC.remove(photoPath);
-    return false;
+    fs::File photoFile = SD_MMC.open(photoPath, FILE_WRITE, true);
+    if (!photoFile) {
+      Serial.printf("Falha ao abrir %s para escrita JPEG (tentativa %u).\n",
+                    photoPath, attempt + 1);
+      delay(25);
+      continue;
+    }
+
+    size_t writtenTotal = 0;
+    bool ok = writeBuffered(photoFile, jpegData, jpegLen, &writtenTotal);
+    photoFile.flush();
+    photoFile.close();
+
+    fs::File verifyFile = SD_MMC.open(photoPath, FILE_READ);
+    size_t verifySize = verifyFile ? verifyFile.size() : 0;
+    if (verifyFile) verifyFile.close();
+
+    Serial.printf("Verificacao JPEG %s: escrito=%u salvo=%u esperado=%u tentativa=%u\n",
+                  photoPath, (unsigned)writtenTotal, (unsigned)verifySize,
+                  (unsigned)jpegLen, attempt + 1);
+
+    if (ok && writtenTotal == jpegLen && verifySize == jpegLen) {
+      if (savedBytes) *savedBytes = writtenTotal;
+      return true;
+    }
+
+    SD_MMC.remove(photoPath);
+    delay(35);
   }
 
-  return true;
+  if (savedBytes) *savedBytes = 0;
+  return false;
+}
+
+bool writeJpegWithSDRecovery(const char *photoPath, const uint8_t *jpegData,
+                             size_t jpegLen, size_t *savedBytes) {
+  if (writeJpegToSD(photoPath, jpegData, jpegLen, savedBytes)) return true;
+
+  Serial.println("Reiniciando barramento SD para nova tentativa de gravacao.");
+  endSDSession();
+  delay(60);
+
+  if (!beginSDSession() || !ensureDCIMFolder()) return false;
+  return writeJpegToSD(photoPath, jpegData, jpegLen, savedBytes);
 }
 
 bool writeBmpFromPreviewFrame(const char *photoPath, const uint8_t *rgb565Frame, size_t frameLen, size_t *savedBytes) {
@@ -2409,11 +2529,34 @@ bool captureAndSavePhoto() {
     return false;
   }
 
-  Serial.printf("JPEG capturado: %ux%u %u bytes\n", (unsigned)fb->width, (unsigned)fb->height, (unsigned)fb->len);
+  size_t jpegLength = fb->len;
+  uint16_t capturedWidth = fb->width;
+  uint16_t capturedHeight = fb->height;
+  uint8_t *jpegCopy = (uint8_t *)allocImageBuffer(jpegLength);
+
+  if (!jpegCopy) {
+    Serial.printf("Sem memoria para isolar JPEG de %u bytes antes do SD.\n", (unsigned)jpegLength);
+    esp_camera_fb_return(fb);
+    showStatus("Memoria baixa", COLOR_BAD, 1400);
+    initializeCamera(CAMERA_PREVIEW_JPEG);
+    drawCameraScreen();
+    return false;
+  }
+
+  memcpy(jpegCopy, fb->buf, jpegLength);
+  esp_camera_fb_return(fb);
+  fb = nullptr;
+
+  // Interrompe I2S/DMA e libera os framebuffers antes de entregar o barramento
+  // compartilhado ao SD. O JPEG ja esta preservado integralmente na PSRAM.
+  desligarCamera();
+
+  Serial.printf("JPEG isolado: %ux%u %u bytes\n",
+                (unsigned)capturedWidth, (unsigned)capturedHeight, (unsigned)jpegLength);
   showStatus("Salvando SD", COLOR_TEXT, 500);
 
   if (!beginSDSession()) {
-    esp_camera_fb_return(fb);
+    heap_caps_free(jpegCopy);
     showStatus("SD nao encontrado", COLOR_WARN, 1400);
     initializeCamera(CAMERA_PREVIEW_JPEG);
     drawCameraScreen();
@@ -2421,40 +2564,41 @@ bool captureAndSavePhoto() {
   }
 
   bool ok = false;
+  const char *failureStatus = nullptr;
   char photoPath[PHOTO_PATH_LEN];
 
   if (!ensureDCIMFolder()) {
-    showStatus("Erro /DCIM", COLOR_BAD, 1400);
+    failureStatus = "Erro /DCIM";
   } else {
     scanNextPhotoNumber();
     if (!getNextAvailablePhotoPath(photoPath, sizeof(photoPath))) {
-      showStatus("Nome indispon.", COLOR_BAD, 1400);
+      failureStatus = "Nome indispon.";
     } else {
       uint64_t total = SD_MMC.totalBytes();
       uint64_t used = SD_MMC.usedBytes();
       uint64_t freeBytes = total > used ? total - used : 0;
       Serial.printf("SD pronto para escrita. Total=%llu Usado=%llu Livre=%llu Arquivo=%s Tamanho=%u\n",
-                    total, used, freeBytes, photoPath, (unsigned)fb->len);
+                    total, used, freeBytes, photoPath, (unsigned)jpegLength);
 
-      if (freeBytes > 0 && freeBytes < fb->len + 4096) {
+      if (freeBytes > 0 && freeBytes < jpegLength + 4096) {
         Serial.println("Espaco insuficiente no SD.");
-        showStatus("Espaco insuf.", COLOR_BAD, 1400);
+        failureStatus = "Espaco insuf.";
       } else {
         size_t savedBytes = 0;
-        if (writeJpegToSD(photoPath, fb->buf, fb->len, &savedBytes)) {
+        if (writeJpegWithSDRecovery(photoPath, jpegCopy, jpegLength, &savedBytes)) {
           Serial.printf("Foto JPEG salva: %s (%u bytes)\n", photoPath, (unsigned)savedBytes);
           nextPhotoNumber++;
           ok = true;
         } else {
           Serial.println("Falha ao salvar JPEG.");
-          showStatus("Erro salvar", COLOR_BAD, 1400);
+          failureStatus = "Erro salvar";
         }
       }
     }
   }
 
   endSDSession();
-  esp_camera_fb_return(fb);
+  heap_caps_free(jpegCopy);
   initializeCamera(CAMERA_PREVIEW_JPEG);
   drawCameraScreen();
 
@@ -2462,6 +2606,10 @@ bool captureAndSavePhoto() {
     char msg[18];
     snprintf(msg, sizeof(msg), "Salva %04u", nextPhotoNumber - 1);
     showStatus(msg, COLOR_OK, 1200);
+  } else if (failureStatus) {
+    // O TFT compartilha GPIO14/15 com o SD. Mensagens so podem ser desenhadas
+    // depois que endSDSession() devolveu o barramento ao display.
+    showStatus(failureStatus, COLOR_BAD, 1400);
   }
 
   logHeap("apos-captura");
