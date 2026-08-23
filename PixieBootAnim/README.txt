@@ -11,6 +11,7 @@ Arquivos do projeto
 - PixieBootAnim.ino: codigo principal completo.
 - boot_animation.h: animacao de inicializacao existente em PROGMEM, preservada.
 - README.txt: instrucoes, pinos e dependencias.
+- DIAGNOSTICO-SD.md: significado dos codigos mostrados apos a captura.
 
 Bibliotecas necessarias
 -----------------------
@@ -274,17 +275,26 @@ Formatar SD nao executa imediatamente. O codigo mostra confirmacao com:
 - Nao
 
 A selecao padrao e Nao. Ao confirmar Sim, o conteudo do cartao e apagado,
-/DCIM e recriado e a numeracao das fotos volta para 1. Se o cartao estiver em
-exFAT ou com um sistema de arquivos que o FATFS nao consegue montar, formate-o
-primeiro em FAT32 no computador. A captura normal nunca formata nem apaga o
-cartao automaticamente.
+/DCIM e recriado e a numeracao das fotos volta para 1. A captura normal nunca
+formata nem apaga o cartao automaticamente.
 
-A formatacao usa a API oficial esp_vfs_fat_sdcard_format_cfg do ESP-IDF, com
-unidade de alocacao de 16 KB. Ela roda em uma tarefa dedicada com 8 KB de stack,
-enquanto o loop principal continua cedendo CPU ao sistema. Isso evita o reinicio
-por watchdog que podia ocorrer quando a operacao longa era executada dentro de
-SD_MMC.begin(). O TFT permanece sem receber comandos ate o fim da formatacao,
-pois compartilha os pinos do SD.
+O firmware cobre os dois casos de formatacao sem reiniciar o aparelho:
+
+- Em um volume FAT montavel, usa a API oficial
+  esp_vfs_fat_sdcard_format_cfg do ESP-IDF com unidade de alocacao de 16 KB.
+- Em um cartao vazio, exFAT ou com FAT corrompido, repete a montagem com
+  format_if_mount_failed. O ESP-IDF cria a tabela de particao, formata em FAT e
+  monta o novo volume.
+
+As operacoes longas de montagem/recuperacao e formatacao rodam em tarefas
+dedicadas com 8 KB de stack, enquanto o loop principal continua cedendo CPU ao
+sistema. O TFT permanece sem receber comandos ate o fim, pois compartilha os
+pinos do SD. Depois de criar /DCIM, o firmware desmonta e monta o cartao de novo
+e so mostra "SD formatado" se tipo, capacidade e pasta forem confirmados.
+
+Formatacao nao corrige ausencia fisica, mau contato ou um GPIO2/DAT0 preso em
+LOW pelo circuito dos botoes; nesses casos a tela informa erro e o aparelho
+continua no menu.
 
 Flash alterna entre ON e OFF. A preferencia e salva com Preferences e mantida
 apos reiniciar. O LED do flash acende apenas durante a captura.
@@ -304,9 +314,8 @@ A camera usa dois perfis no mesmo modo JPEG:
   CAMERA_GRAB_LATEST quando a memoria permite. O quadro e rotacionado,
   espelhado e recortado proporcionalmente para ocupar os 160x80 completos sem
   achatar pessoas ou objetos.
-- Captura: JPEG em alta resolucao e compressao minima somente no momento de
-  salvar no SD. Tenta qualidade JPEG 0, o melhor valor aceito pelo driver, e
-  usa qualidade 2 apenas se o quadro maximo nao couber no buffer da placa.
+- Captura: JPEG em alta resolucao, qualidade 10 (perfil usado no exemplo
+  CameraWebServer oficial da Espressif com PSRAM) e fallback em qualidade 12.
 
 Assim o display usa uma qualidade menor que a foto salva, mas melhor que o
 preview antigo, enquanto o arquivo no SD prioriza a melhor qualidade possivel
@@ -321,9 +330,10 @@ Resolucao:
 
 - Com PSRAM, o boot tenta reservar 2 framebuffers UXGA 1600x1200. Se nao
   couberem, tenta 1 buffer UXGA e depois SXGA, XGA, SVGA, VGA, QVGA ou QQVGA.
-- A qualidade JPEG da captura usa valor 0. No driver da camera, valores menores
-  significam menos compressao e melhor qualidade. Se a cena gerar um JPEG
-  maior que o buffer, o firmware repete automaticamente em qualidade 2.
+- A qualidade JPEG da captura usa valor 10. No driver da camera, valores
+  menores significam menos compressao e arquivos maiores; valores 0/2 podiam
+  exceder o framebuffer em UXGA. Se o quadro ainda nao vier completo, o
+  firmware repete em qualidade 12 e reduz a resolucao ate um perfil seguro.
 - Sem PSRAM ativa, o firmware tenta SVGA/VGA em DRAM e cai para QVGA/QQVGA se
   faltar memoria. Se as fotos continuarem pequenas no computador, confirme no
   Serial que aparece "PSRAM: disponivel" e selecione AI Thinker ESP32-CAM com
@@ -331,10 +341,10 @@ Resolucao:
 
 O preview volta automaticamente para JPEG QQVGA depois da captura. Para evitar
 salvar uma foto pequena logo apos a troca de resolucao, o codigo le as dimensoes
-codificadas dentro do proprio JPEG e descarta qualquer quadro antigo. Nao existe
-mais espera fixa de 900 ms nem descarte obrigatorio de dois frames. A troca de
-perfil ocorre nos buffers preparados sequencialmente durante o boot, e a confirmacao visual
-do clique aparece em 6 ms.
+codificadas dentro do proprio JPEG e descarta qualquer quadro antigo. Dois
+quadros estabilizam o sensor com o flash apagado. O flash acende por 150 ms
+somente ao redor de cada quadro aproveitavel, evitando um pico de corrente longo
+durante reconfiguracoes e tentativas.
 
 Assim que o quadro correto e capturado, o JPEG completo e copiado sem
 recodificacao para um buffer independente na PSRAM. O framebuffer e devolvido e
@@ -358,13 +368,13 @@ JPEG capturado: 1600x1200 ... bytes
 
 A escrita no SD usa um buffer global DMA de 4096 bytes, reduzindo a pressao
 sobre a RAM interna enquanto a foto de alta qualidade permanece na PSRAM. O
-SD_MMC trabalha em modo 1-bit na frequencia padrao de 20 MHz, com uma unica
-inicializacao por sessao, igual ao fluxo estavel do repositorio. O JPEG e
+SD_MMC trabalha em modo 1-bit e tenta montar em 20 MHz, 10 MHz e 5 MHz. O JPEG e
 escrito em blocos, fechado e reaberto para conferir o tamanho. Se a escrita
 falhar, o arquivo incompleto e removido, o firmware repete a operacao e, se
 necessario, desmonta e remonta completamente o cartao antes da ultima tentativa.
 Mensagens de erro so sao desenhadas depois que o SD foi desmontado, porque o
-TFT compartilha GPIO14 e GPIO15 com ele.
+TFT compartilha GPIO14 e GPIO15 com ele. O preview fica pausado durante a
+mensagem para que o resultado ou codigo de falha nao seja apagado da tela.
 
 Nomes de arquivo:
 
@@ -375,15 +385,15 @@ Nomes de arquivo:
 Ao tirar foto ou depois de ler a galeria, o codigo procura o maior numero
 existente e define o proximo nome sem sobrescrever arquivos.
 
-Erros tratados visualmente e no Serial:
+Erros tratados visualmente e no Serial usam codigos persistentes, por exemplo:
 
-- SD ausente.
-- Falha ao criar /DCIM.
-- Falha de camera.
-- Framebuffer invalido.
-- Espaco insuficiente.
-- Falha ao abrir ou escrever arquivo.
-- Escrita incompleta.
+- CAM E1/E2/E3/E4: inicializacao, quadro JPEG, JPEG invalido ou memoria.
+- SD E1: GPIO2/DAT0 permaneceu em LOW.
+- SD E3/E4: montagem falhou ou nao ha cartao.
+- SD E5/E6/E7/E8: criar pasta, abrir, gravar ou conferir arquivo.
+- SD E9: cartao cheio.
+
+Consulte `DIAGNOSTICO-SD.md` para a tabela completa.
 
 Galeria
 -------
@@ -457,11 +467,12 @@ para o inicializador correto da sua tela.
 Verificacao feita
 -----------------
 
-Compilado localmente com:
+Versao 1.2.0 compilada localmente com ESP32 Arduino 3.3.11 e avisos habilitados:
 
 arduino-cli compile --fqbn esp32:esp32:esp32cam PixieBootAnim
 
 Resultado:
 
-- Sketch: 549823 bytes de flash.
-- Variaveis globais: 76464 bytes de RAM.
+- Sketch: 551703 bytes de flash.
+- Variaveis globais: 76472 bytes de RAM.
+- Erros e avisos do sketch: nenhum.
