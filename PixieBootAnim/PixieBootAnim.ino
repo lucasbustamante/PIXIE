@@ -4,9 +4,6 @@
 #include "esp_sleep.h"
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
-#include "esp_vfs_fat.h"
-#include "freertos/semphr.h"
-#include "vfs_api.h"
 #include <FS.h>
 #include <SD_MMC.h>
 #include <SPI.h>
@@ -18,12 +15,11 @@
 
 // --- Projeto ---
 #define PROJECT_NAME        "PixieCam"
-#define PROJECT_VERSION     "1.2.0"
+#define PROJECT_VERSION     "1.0.0"
 #define PROJECT_DEVELOPER   "Desenvolvedor: edite este texto"
 #define DCIM_DIR            "/DCIM"
 #define PHOTO_PREFIX        "PHOTO_"
 #define PHOTO_EXTENSION     ".jpg"
-#define ENABLE_SERIAL_DEBUG 0
 
 // --- Pinos do display ST7735 0.96 80x160 ---
 #define TFT_CS   13
@@ -67,9 +63,6 @@
 #define CHECK_SD_ON_BOOT 0
 
 #define TFT_APP_ROTATION 3
-#define TFT_INIT_PROFILE INITR_MINI160x80_PLUGIN
-#define CAMERA_DISPLAY_ROTATE_LEFT 1
-#define CAMERA_DISPLAY_MIRROR_HORIZONTAL 1
 #define SCREEN_W 160
 #define SCREEN_H 80
 #define MAX_PHOTOS 120
@@ -83,25 +76,15 @@
 #define PREVIEW_AREA_Y 12
 #define PREVIEW_AREA_H 68
 #define GALLERY_INFO_Y 66
-#define CAMERA_CAPTURE_JPEG_QUALITY 10
-#define CAMERA_CAPTURE_FALLBACK_QUALITY 12
+#define CAMERA_CAPTURE_JPEG_QUALITY 2
 #define CAMERA_PREVIEW_JPEG_QUALITY 12
-#define CAMERA_PREVIEW_FRAME_SIZE FRAMESIZE_QQVGA
-#define CAPTURE_SENSOR_SETTLE_MS 80
-#define PREVIEW_SENSOR_SETTLE_MS 0
+#define CAMERA_PREVIEW_FRAME_SIZE FRAMESIZE_QVGA
+#define CAPTURE_SENSOR_SETTLE_MS 900
+#define PREVIEW_SENSOR_SETTLE_MS 35
 #define CAPTURE_WARMUP_FRAMES 2
-#define CAPTURE_FRAME_READY_TIMEOUT_MS 5000
 #define CAPTURE_TRY_ULTRA_RES 1
 #define SD_IO_BUFFER_SIZE 4096
-#define SD_MOUNT_FREQ_KHZ SDMMC_FREQ_DEFAULT
-#define SD_MOUNT_RETRY_FREQ_KHZ 10000
-#define SD_MOUNT_SAFE_FREQ_KHZ 5000
-#define SD_MAX_OPEN_FILES 5
-#define SD_FORMAT_ALLOCATION_UNIT 16384
-#define SD_MOUNT_TASK_STACK_SIZE 8192
-#define SD_FORMAT_TASK_STACK_SIZE 8192
 #define MAX_GALLERY_JPEG_BYTES 5000000
-#define CAMERA_BOOT_GUARD_MAGIC 0x50495843UL
 
 #define COLOR_BG       0x0000
 #define COLOR_PANEL    0x1082
@@ -118,20 +101,7 @@ SPIClass vspi(VSPI);
 Adafruit_ST7735 tft = Adafruit_ST7735(&vspi, TFT_CS, TFT_DC, TFT_RST);
 Preferences preferences;
 
-// A classe Arduino SDMMCFS nao expoe o handle exigido pela API oficial de
-// formatacao do ESP-IDF. Esta subclasse usa exatamente a mesma implementacao,
-// mas disponibiliza o handle protegido sem alterar a biblioteca instalada.
-class PixieSDMMCFS : public fs::SDMMCFS {
-public:
-  explicit PixieSDMMCFS(fs::FSImplPtr impl) : fs::SDMMCFS(impl) {}
-  sdmmc_card_t *cardHandle() { return _card; }
-};
-
-PixieSDMMCFS pixieSD(fs::FSImplPtr(new VFSImpl()));
-#define SD_MMC pixieSD
-
 uint16_t lineBuffer[SCREEN_W];
-uint16_t previewFrameBuffer[SCREEN_W * SCREEN_H];
 DMA_ATTR uint8_t sdIoBuffer[SD_IO_BUFFER_SIZE];
 
 enum AppState {
@@ -141,7 +111,6 @@ enum AppState {
   STATE_SETTINGS,
   STATE_SD_INFO,
   STATE_SD_FORMAT_CONFIRM,
-  STATE_RESET_CONFIRM,
   STATE_FLASH_SETTINGS,
   STATE_ABOUT,
   STATE_GALLERY,
@@ -192,10 +161,6 @@ bool psramAvailable = false;
 bool uiDirty = true;
 bool bootFinished = false;
 bool buttonStuckWarning = false;
-bool safeCameraBoot = false;
-RTC_NOINIT_ATTR uint32_t cameraBootGuard;
-const char *lastStorageError = nullptr;
-uint32_t activeSDMountFreqKHz = 0;
 
 uint16_t nextPhotoNumber = 1;
 PhotoEntry photos[MAX_PHOTOS];
@@ -219,12 +184,6 @@ unsigned long lastRepeatMs = 0;
 
 ButtonType stableButton = BTN_NONE;
 ButtonType lastRawButton = BTN_NONE;
-uint16_t lastButtonAdcValue = 4095;
-uint16_t buttonAdcIdle = 4095;
-uint16_t buttonAdcUp = 0;
-uint16_t buttonAdcDown = 0;
-uint16_t buttonAdcOk = 0;
-bool buttonCalibrationValid = false;
 bool longEventSent = false;
 bool powerEventSent = false;
 
@@ -232,35 +191,23 @@ int16_t jpegViewportX = 0;
 int16_t jpegViewportY = 0;
 int16_t jpegViewportW = SCREEN_W;
 int16_t jpegViewportH = SCREEN_H;
-int16_t jpegDrawX = 0;
-int16_t jpegDrawY = 0;
-uint16_t jpegDecodedW = 0;
-uint16_t jpegDecodedH = 0;
-uint16_t jpegCropX = 0;
-uint16_t jpegCropY = 0;
-uint16_t jpegCropW = 0;
-uint16_t jpegCropH = 0;
-bool jpegRotateLeft = false;
-bool jpegMirrorHorizontal = false;
-bool jpegStretchToViewport = false;
 bool captureProfileCached = false;
 framesize_t cachedCaptureFrameSize = FRAMESIZE_SVGA;
 bool cachedCaptureUsesPsram = false;
 uint8_t cachedCaptureFbCount = 1;
 framesize_t activeSensorFrameSize = CAMERA_PREVIEW_FRAME_SIZE;
 
-const unsigned long debounceDelay = 12;
-const unsigned long repeatDelayMs = 420;
-const unsigned long repeatIntervalMs = 150;
+const unsigned long debounceDelay = 80;
+const unsigned long repeatDelayMs = 650;
+const unsigned long repeatIntervalMs = 240;
 const unsigned long backHoldMs = 900;
 const unsigned long tempoSegurarPower = 3000;
 const unsigned long stuckButtonMs = 8500;
-const unsigned long cameraFrameIntervalMs = 15;
+const unsigned long cameraFrameIntervalMs = 45;
 const unsigned long menuAnimMs = 130;
 
 const char *mainMenuItems[] = {"Camera", "Configuracoes", "Galeria", "Desligar"};
-const char *settingsItems[] = {"Cartao SD", "Flash", "Sobre", "Reset config", "Voltar"};
-const char firmwareBuildId[] = __DATE__ " " __TIME__;
+const char *settingsItems[] = {"Cartao SD", "Flash", "Sobre", "Voltar"};
 
 // Prototipos principais
 void initializeDisplay();
@@ -279,7 +226,6 @@ void drawSettingsMenu();
 void drawSDInfo();
 void drawGallery();
 void drawPowerConfirmation();
-void drawResetConfirmation();
 bool captureAndSavePhoto();
 void loadPhotoList();
 void showPhoto(int index);
@@ -368,8 +314,7 @@ void normalizePhotoPath(const char *name, char *out, size_t outSize) {
 }
 
 void logHeap(const char *label) {
-  Serial.printf("[%s] heap=%lu psram=%lu\n", label,
-                (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getFreePsram());
+  Serial.printf("[%s] heap=%u psram=%u\n", label, ESP.getFreeHeap(), ESP.getFreePsram());
 }
 
 void backlightOn() {
@@ -386,8 +331,6 @@ void backlightOff() {
 }
 
 void restoreDisplayBus() {
-  pinMode(FLASH_PIN, OUTPUT);
-  digitalWrite(FLASH_PIN, LOW);
   pinMode(TFT_CS, OUTPUT);
   pinMode(TFT_DC, OUTPUT);
   pinMode(TFT_RST, OUTPUT);
@@ -400,31 +343,14 @@ void restoreDisplayBus() {
 }
 
 void prepareSharedPinsForSD() {
-  // No modo SD de 1 bit apenas CLK, CMD e DAT0 sao usados pelo barramento;
-  // DAT3 deve permanecer alto. D1 e D2 nao participam da transferencia.
-  // No AI Thinker, GPIO4/DAT1 tambem aciona o LED de flash: ele precisa
-  // continuar como saida LOW para nao causar pico de corrente.
-  digitalWrite(FLASH_PIN, LOW);
   digitalWrite(TFT_CS, HIGH);
   vspi.end();
 
-  pinMode(TFT_CS, OUTPUT);
-  digitalWrite(TFT_CS, HIGH);
-  pinMode(FLASH_PIN, OUTPUT);
-  digitalWrite(FLASH_PIN, LOW);
-  gpio_set_level((gpio_num_t)FLASH_PIN, 0);
-
-  // GPIO12 e o pino de strap da tensao do flash do ESP32 e nao e usado no
-  // SD_MMC de 1 bit. Deixe-o em alta impedancia, sem forcar pull-up.
-  pinMode(TFT_MOSI, INPUT);
+  // GPIO14/15/2 pertencem ao SD interno em modo 1-bit. Como tambem sao usados
+  // pelo TFT/botoes, deixe-os livres antes de chamar SD_MMC.begin().
   pinMode(TFT_SCLK, INPUT_PULLUP);
   pinMode(TFT_DC, INPUT_PULLUP);
   pinMode(BUTTON_ADC_PIN, INPUT_PULLUP);
-
-  gpio_pulldown_dis((gpio_num_t)TFT_DC);
-  gpio_pulldown_dis((gpio_num_t)BUTTON_ADC_PIN);
-  gpio_pullup_en((gpio_num_t)TFT_DC);
-  gpio_pullup_en((gpio_num_t)BUTTON_ADC_PIN);
   delay(20);
 }
 
@@ -467,9 +393,10 @@ void mostrarAnimacaoInicial() {
     delay(BOOT_ANIM_DELAY_MS);
   }
 
-  delay(20);
+  delay(150);
 
   tft.setRotation(TFT_APP_ROTATION);
+  tft.fillScreen(ST77XX_BLACK);
 }
 
 void centerText(const char *text, int16_t y, uint16_t color, uint8_t size) {
@@ -485,18 +412,9 @@ void centerText(const char *text, int16_t y, uint16_t color, uint8_t size) {
 }
 
 void drawHeader(const char *title) {
-  tft.fillRect(0, 0, SCREEN_W, 18, COLOR_PANEL);
-  tft.fillRect(0, 0, 3, 18, COLOR_ACCENT);
-  tft.drawFastHLine(3, 17, SCREEN_W - 3, COLOR_PANEL_2);
-
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_TEXT, COLOR_PANEL);
-  tft.setCursor(8, 5);
-  tft.print(title);
-
-  tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
-  tft.setCursor(126, 5);
-  tft.print("PIXIE");
+  tft.fillRect(0, 0, SCREEN_W, 18, COLOR_BG);
+  tft.drawFastHLine(0, 18, SCREEN_W, COLOR_PANEL_2);
+  centerText(title, 5, COLOR_TEXT, 1);
 }
 
 void showStatus(const char *msg, uint16_t color = COLOR_TEXT, unsigned long durationMs = 900) {
@@ -527,184 +445,14 @@ void mostrarContadorPower(const char *acao, int segundos) {
   centerText(numberText, 42, COLOR_WARN, 3);
 }
 
-uint16_t readButtonAdcMedian() {
-  uint16_t samples[5];
-
-  for (uint8_t i = 0; i < 5; i++) {
-    samples[i] = analogRead(BUTTON_ADC_PIN);
-  }
-
-  for (uint8_t i = 1; i < 5; i++) {
-    uint16_t value = samples[i];
-    int8_t j = i - 1;
-    while (j >= 0 && samples[j] > value) {
-      samples[j + 1] = samples[j];
-      j--;
-    }
-    samples[j + 1] = value;
-  }
-
-  return samples[2];
-}
-
-uint16_t adcDistance(uint16_t a, uint16_t b) {
-  return a > b ? a - b : b - a;
-}
-
-uint16_t measureButtonAdcCenter(uint16_t idleReference) {
-  const uint8_t sampleCount = 24;
-  uint32_t sum = 0;
-  uint8_t accepted = 0;
-
-  while (accepted < sampleCount) {
-    uint16_t value = readButtonAdcMedian();
-    if (adcDistance(value, idleReference) >= 80) {
-      sum += value;
-      accepted++;
-    } else {
-      sum = 0;
-      accepted = 0;
-    }
-    delay(2);
-  }
-
-  return sum / sampleCount;
-}
-
-void drawButtonCalibrationPrompt(const char *buttonName) {
-  tft.fillScreen(COLOR_BG);
-  drawHeader("Calibracao");
-  centerText("Pressione", 25, COLOR_TEXT, 1);
-  centerText(buttonName, 39, COLOR_ACCENT, 2);
-  centerText("depois solte", 66, COLOR_MUTED, 1);
-}
-
-uint16_t calibrateButtonStep(const char *buttonName) {
-  drawButtonCalibrationPrompt(buttonName);
-
-  while (adcDistance(readButtonAdcMedian(), buttonAdcIdle) < 80) {
-    delay(2);
-  }
-
-  delay(18);
-  uint16_t center = measureButtonAdcCenter(buttonAdcIdle);
-
-  tft.fillScreen(COLOR_BG);
-  drawHeader("Calibracao");
-  centerText("Registrado", 30, COLOR_OK, 1);
-  centerText("Solte o botao", 49, COLOR_TEXT, 1);
-
-  while (adcDistance(readButtonAdcMedian(), buttonAdcIdle) >= 50) {
-    delay(2);
-  }
-  delay(35);
-
-  return center;
-}
-
-bool calibratedButtonCentersAreValid() {
-  const uint16_t minimumSeparation = 100;
-  return adcDistance(buttonAdcUp, buttonAdcDown) >= minimumSeparation &&
-         adcDistance(buttonAdcUp, buttonAdcOk) >= minimumSeparation &&
-         adcDistance(buttonAdcDown, buttonAdcOk) >= minimumSeparation &&
-         adcDistance(buttonAdcIdle, buttonAdcUp) >= minimumSeparation &&
-         adcDistance(buttonAdcIdle, buttonAdcDown) >= minimumSeparation &&
-         adcDistance(buttonAdcIdle, buttonAdcOk) >= minimumSeparation;
-}
-
-uint32_t firmwareBuildSignature() {
-  uint32_t hash = 2166136261UL;
-  for (size_t i = 0; firmwareBuildId[i] != 0; i++) {
-    hash ^= (uint8_t)firmwareBuildId[i];
-    hash *= 16777619UL;
-  }
-  return hash;
-}
-
-void loadButtonCalibration() {
-  uint32_t storedBuild = preferences.getUInt("btn_build", 0);
-  if (storedBuild != firmwareBuildSignature()) {
-    buttonCalibrationValid = false;
-    return;
-  }
-
-  buttonCalibrationValid = preferences.getBool("btn_cal", false);
-  if (!buttonCalibrationValid) return;
-
-  buttonAdcIdle = preferences.getUShort("btn_idle", 4095);
-  buttonAdcUp = preferences.getUShort("btn_up", 0);
-  buttonAdcDown = preferences.getUShort("btn_down", 0);
-  buttonAdcOk = preferences.getUShort("btn_ok", 0);
-  buttonCalibrationValid = calibratedButtonCentersAreValid();
-}
-
-void runButtonCalibration() {
-  while (true) {
-    tft.fillScreen(COLOR_BG);
-    drawHeader("Calibracao");
-    centerText("Solte os botoes", 31, COLOR_TEXT, 1);
-    centerText("Preparando...", 49, COLOR_MUTED, 1);
-
-    while (readButtonAdcMedian() < 3800) {
-      delay(3);
-    }
-    delay(120);
-
-    uint32_t idleSum = 0;
-    for (uint8_t i = 0; i < 24; i++) {
-      idleSum += readButtonAdcMedian();
-      delay(2);
-    }
-    buttonAdcIdle = idleSum / 24;
-
-    buttonAdcUp = calibrateButtonStep("PARA CIMA");
-    buttonAdcDown = calibrateButtonStep("PARA BAIXO");
-    buttonAdcOk = calibrateButtonStep("OK");
-
-    if (calibratedButtonCentersAreValid()) break;
-
-    showCenteredMessage("Valores iguais", "Tente novamente", COLOR_WARN);
-    delay(1200);
-  }
-
-  preferences.putUShort("btn_idle", buttonAdcIdle);
-  preferences.putUShort("btn_up", buttonAdcUp);
-  preferences.putUShort("btn_down", buttonAdcDown);
-  preferences.putUShort("btn_ok", buttonAdcOk);
-  preferences.putUInt("btn_build", firmwareBuildSignature());
-  preferences.putBool("btn_cal", true);
-  buttonCalibrationValid = true;
-
-  showCenteredMessage("Botoes prontos", "Calibracao salva", COLOR_OK);
-  delay(700);
-}
-
 ButtonType lerBotao() {
-  lastButtonAdcValue = readButtonAdcMedian();
+  int valor = analogRead(BUTTON_ADC_PIN);
 
-  if (!buttonCalibrationValid) return BTN_NONE;
+  if (valor < 100) return BTN_FOTO;
+  if (valor > 200 && valor < 900) return BTN_DOWN;
+  if (valor > 900 && valor < 3900) return BTN_UP;
 
-  ButtonType nearestButton = BTN_NONE;
-  uint16_t nearestDistance = adcDistance(lastButtonAdcValue, buttonAdcIdle);
-
-  uint16_t distance = adcDistance(lastButtonAdcValue, buttonAdcUp);
-  if (distance < nearestDistance) {
-    nearestDistance = distance;
-    nearestButton = BTN_UP;
-  }
-
-  distance = adcDistance(lastButtonAdcValue, buttonAdcDown);
-  if (distance < nearestDistance) {
-    nearestDistance = distance;
-    nearestButton = BTN_DOWN;
-  }
-
-  distance = adcDistance(lastButtonAdcValue, buttonAdcOk);
-  if (distance < nearestDistance) {
-    nearestButton = BTN_FOTO;
-  }
-
-  return nearestButton;
+  return BTN_NONE;
 }
 
 ButtonEvent readButtonEvent() {
@@ -729,23 +477,17 @@ ButtonEvent readButtonEvent() {
     buttonStuckWarning = false;
 
     if (stableButton != BTN_NONE) {
-#if ENABLE_SERIAL_DEBUG
-      Serial.printf("Botao ADC=%u tipo=%u\n", lastButtonAdcValue, (unsigned)stableButton);
-#endif
       buttonPressStartMs = now;
       lastRepeatMs = now;
       longEventSent = false;
       powerEventSent = false;
-
-      // Navegacao responde ao pressionar. OK continua sendo confirmado ao
-      // soltar para distinguir clique curto dos atalhos por pressionamento.
-      if (stableButton == BTN_UP) event.type = EVT_UP;
-      else if (stableButton == BTN_DOWN) event.type = EVT_DOWN;
       return event;
     }
 
     if (wasPressed && !longEventSent && !powerEventSent) {
       if (releasedButton == BTN_FOTO) event.type = EVT_OK_SHORT;
+      else if (releasedButton == BTN_UP) event.type = EVT_UP;
+      else if (releasedButton == BTN_DOWN) event.type = EVT_DOWN;
     }
 
     return event;
@@ -815,9 +557,7 @@ camera_config_t makeCameraConfig(CameraMode mode, framesize_t frameSize, bool us
   config.fb_location = usePsramBuffer ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.grab_mode = fbCount > 1 ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.jpeg_quality = mode == CAMERA_PREVIEW_JPEG
-                          ? CAMERA_PREVIEW_JPEG_QUALITY
-                          : CAMERA_CAPTURE_JPEG_QUALITY;
+  config.jpeg_quality = CAMERA_CAPTURE_JPEG_QUALITY;
 
   return config;
 }
@@ -835,10 +575,10 @@ void applySensorDefaults() {
   s->set_wb_mode(s, 0);
   s->set_gain_ctrl(s, 1);
   s->set_exposure_ctrl(s, 1);
-  s->set_aec2(s, 0);
-  s->set_ae_level(s, 1);
+  s->set_aec2(s, 1);
+  s->set_ae_level(s, 0);
   s->set_gainceiling(s, GAINCEILING_8X);
-  s->set_brightness(s, 1);
+  s->set_brightness(s, 0);
   s->set_contrast(s, 0);
   s->set_saturation(s, 0);
   s->set_dcw(s, 1);
@@ -954,80 +694,6 @@ bool initializeCamera(CameraMode mode) {
     uint8_t fbCount;
   };
 
-  // Reserva no boot os maiores buffers que couberem e depois baixa somente o
-  // sensor para QQVGA. Assim o preview permanece leve, mas a foto pode mudar
-  // para alta resolucao sem desligar e reinicializar toda a camera.
-  if (mode == CAMERA_PREVIEW_JPEG) {
-    CameraAttempt previewAttempts[] = {
-#if CAPTURE_TRY_ULTRA_RES
-      {FRAMESIZE_UXGA, true, 2},
-      {FRAMESIZE_UXGA, true, 1},
-      {FRAMESIZE_SXGA, true, 2},
-      {FRAMESIZE_SXGA, true, 1},
-#endif
-      {FRAMESIZE_XGA, true, 2},
-      {FRAMESIZE_XGA, true, 1},
-      {FRAMESIZE_SVGA, true, 2},
-      {FRAMESIZE_SVGA, true, 1},
-      {FRAMESIZE_VGA, true, 1},
-      {FRAMESIZE_SVGA, false, 1},
-      {FRAMESIZE_VGA, false, 1},
-      {FRAMESIZE_QVGA, false, 1},
-      {CAMERA_PREVIEW_FRAME_SIZE, true, 2},
-      {CAMERA_PREVIEW_FRAME_SIZE, false, 2},
-      {CAMERA_PREVIEW_FRAME_SIZE, false, 1}
-    };
-
-    for (uint8_t i = 0; i < sizeof(previewAttempts) / sizeof(previewAttempts[0]); i++) {
-      if (safeCameraBoot && previewAttempts[i].frameSize != CAMERA_PREVIEW_FRAME_SIZE) continue;
-      if (previewAttempts[i].usePsram && !psramAvailable) continue;
-
-      camera_config_t config = makeCameraConfig(CAMERA_PREVIEW_JPEG,
-                                                previewAttempts[i].frameSize,
-                                                previewAttempts[i].usePsram,
-                                                previewAttempts[i].fbCount);
-      Serial.printf("Tentando reservar buffer %s memoria=%s fb=%u\n",
-                    frameSizeName(previewAttempts[i].frameSize),
-                    previewAttempts[i].usePsram ? "PSRAM" : "DRAM",
-                    previewAttempts[i].fbCount);
-
-      esp_err_t err = esp_camera_init(&config);
-      if (err == ESP_OK) {
-        applySensorDefaults();
-        cameraLigada = true;
-        captureProfileCached = previewAttempts[i].frameSize != CAMERA_PREVIEW_FRAME_SIZE;
-        if (captureProfileCached) {
-          cachedCaptureFrameSize = previewAttempts[i].frameSize;
-          cachedCaptureUsesPsram = previewAttempts[i].usePsram;
-          cachedCaptureFbCount = previewAttempts[i].fbCount;
-        }
-
-        if (setCameraFrameProfile(CAMERA_PREVIEW_FRAME_SIZE,
-                                  CAMERA_PREVIEW_JPEG_QUALITY,
-                                  CAMERA_PREVIEW_JPEG,
-                                  PREVIEW_SENSOR_SETTLE_MS)) {
-          Serial.printf("Preview pronto; captura prealocada=%s memoria=%s fb=%u\n",
-                        captureProfileCached ? frameSizeName(cachedCaptureFrameSize) : "nao",
-                        previewAttempts[i].usePsram ? "PSRAM" : "DRAM",
-                        previewAttempts[i].fbCount);
-          return true;
-        }
-      }
-
-      Serial.printf("Falha ao reservar perfil de camera: 0x%x\n", err);
-      esp_camera_deinit();
-      cameraLigada = false;
-      cameraMode = CAMERA_OFF;
-      digitalWrite(PWDN_GPIO_NUM, HIGH);
-      delay(20);
-      digitalWrite(PWDN_GPIO_NUM, LOW);
-      delay(20);
-    }
-
-    Serial.println("Falha ao inicializar o preview.");
-    return false;
-  }
-
   CameraAttempt captureAttempts[] = {
 #if CAPTURE_TRY_ULTRA_RES
     {FRAMESIZE_UXGA, true, 2},
@@ -1072,7 +738,6 @@ bool initializeCamera(CameraMode mode) {
     }
 
     for (uint8_t i = 0; i < attemptCount; i++) {
-      if (safeCameraBoot && attempts[i].frameSize > FRAMESIZE_SVGA) continue;
       if (attempts[i].usePsram && !psramAvailable) continue;
 
       camera_config_t config = makeCameraConfig(mode, attempts[i].frameSize,
@@ -1152,123 +817,22 @@ void desligarCamera() {
   digitalWrite(PWDN_GPIO_NUM, HIGH);
 }
 
-struct SDMountJob {
-  SemaphoreHandle_t finished;
-  bool formatIfMountFailed;
-  uint32_t frequencyKHz;
-  bool mounted;
-};
-
-void mountSDWorker(void *parameter) {
-  SDMountJob *job = static_cast<SDMountJob *>(parameter);
-  job->mounted = SD_MMC.begin("/sdcard", true, job->formatIfMountFailed,
-                              job->frequencyKHz, SD_MAX_OPEN_FILES);
-  xSemaphoreGive(job->finished);
-  vTaskDelete(nullptr);
-}
-
-bool mountSDController(bool formatIfMountFailed, uint32_t frequencyKHz) {
-  SDMountJob job = {};
-  job.finished = xSemaphoreCreateBinary();
-  job.formatIfMountFailed = formatIfMountFailed;
-  job.frequencyKHz = frequencyKHz;
-  job.mounted = false;
-  if (!job.finished) {
-    Serial.println("Sem memoria para iniciar recuperacao do SD.");
-    setStorageError("SD E12 memoria");
-    return false;
-  }
-
-  TaskHandle_t mountTask = nullptr;
-  BaseType_t created = xTaskCreate(
-    mountSDWorker, "pixie_sd_mount", SD_MOUNT_TASK_STACK_SIZE,
-    &job, tskIDLE_PRIORITY + 1, &mountTask
-  );
-
-  if (created != pdPASS) {
-    Serial.println("Falha ao criar tarefa de recuperacao do SD.");
-    setStorageError("SD E12 memoria");
-    vSemaphoreDelete(job.finished);
-    return false;
-  }
-
-  // A montagem com format_if_mount_failed pode particionar e formatar um
-  // cartao vazio. Espere fora do loop do Arduino, cedendo CPU ao sistema.
-  while (xSemaphoreTake(job.finished, pdMS_TO_TICKS(50)) != pdTRUE) {
-    delay(1);
-  }
-
-  vSemaphoreDelete(job.finished);
-  return job.mounted;
-}
-
-bool beginSDSession(bool quiet = false, bool formatIfMountFailed = false) {
+bool beginSDSession(bool quiet = false) {
   if (sdMounted) return true;
-
-  clearStorageError();
-  activeSDMountFreqKHz = 0;
-
-  // O controlador da camera permanece produzindo quadros mesmo fora da tela
-  // Camera. Pare-o antes de qualquer acesso ao SD para nao disputar DMA/RAM.
-  if (cameraLigada) {
-    desligarCamera();
-    delay(20);
-  }
 
   prepareSharedPinsForSD();
 
-  // GPIO2 e simultaneamente DAT0 e a entrada do ladder de botoes. Se a linha
-  // continuar baixa mesmo com pull-up, nao entregue o pino ao controlador:
-  // isso indica botao preso ou pull-down permanente e evita travar o driver.
-  if (digitalRead(BUTTON_ADC_PIN) == LOW) {
-    if (!quiet) Serial.println("GPIO2/DAT0 esta baixo; solte os botoes e verifique o ladder.");
-    setStorageError("SD E1 GPIO2 LOW");
+  bool pinsOk = SD_MMC.setPins(SD_MMC_CLK_PIN, SD_MMC_CMD_PIN, SD_MMC_D0_PIN);
+  if (!pinsOk) {
+    if (!quiet) Serial.println("Falha ao configurar pinos SD_MMC.");
     sdAvailable = false;
     restoreDisplayBus();
     return false;
   }
 
-  const uint32_t mountFrequencies[] = {
-    SD_MOUNT_FREQ_KHZ,
-    SD_MOUNT_RETRY_FREQ_KHZ,
-    SD_MOUNT_SAFE_FREQ_KHZ
-  };
-  bool mounted = false;
-
-  for (uint8_t attempt = 0;
-       attempt < sizeof(mountFrequencies) / sizeof(mountFrequencies[0]);
-       attempt++) {
-    if (attempt > 0) {
-      SD_MMC.end();
-      delay(80);
-      prepareSharedPinsForSD();
-    }
-
-    bool pinsOk = SD_MMC.setPins(SD_MMC_CLK_PIN, SD_MMC_CMD_PIN, SD_MMC_D0_PIN);
-    if (!pinsOk) {
-      if (!quiet) Serial.println("Falha ao configurar pinos SD_MMC.");
-      setStorageError("SD E2 pinos");
-      break;
-    }
-
-    Serial.printf("Montando SD_MMC 1-bit em %u kHz (recuperacao=%s, tentativa=%u).\n",
-                  (unsigned)mountFrequencies[attempt],
-                  formatIfMountFailed ? "sim" : "nao", attempt + 1);
-    mounted = mountSDController(formatIfMountFailed, mountFrequencies[attempt]);
-    if (mounted) {
-      activeSDMountFreqKHz = mountFrequencies[attempt];
-      break;
-    }
-  }
-
-  // O driver de 1 bit nao usa DAT1; mantenha o flash apagado durante todo o IO.
-  pinMode(FLASH_PIN, OUTPUT);
-  digitalWrite(FLASH_PIN, LOW);
-  gpio_set_level((gpio_num_t)FLASH_PIN, 0);
-
+  bool mounted = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 5);
   if (!mounted) {
     if (!quiet) Serial.println("Cartao SD nao encontrado ou falha de montagem.");
-    if (!lastStorageError) setStorageError("SD E3 montar");
     sdAvailable = false;
     SD_MMC.end();
     restoreDisplayBus();
@@ -1277,7 +841,6 @@ bool beginSDSession(bool quiet = false, bool formatIfMountFailed = false) {
 
   if (SD_MMC.cardType() == CARD_NONE) {
     if (!quiet) Serial.println("Nenhum cartao SD detectado.");
-    setStorageError("SD E4 sem cartao");
     sdAvailable = false;
     SD_MMC.end();
     restoreDisplayBus();
@@ -1286,8 +849,6 @@ bool beginSDSession(bool quiet = false, bool formatIfMountFailed = false) {
 
   sdMounted = true;
   sdAvailable = true;
-  clearStorageError();
-  Serial.printf("SD pronto em %u kHz.\n", (unsigned)activeSDMountFreqKHz);
   return true;
 }
 
@@ -1300,16 +861,12 @@ void endSDSession() {
 }
 
 bool ensureDCIMFolder() {
-  if (!sdMounted) {
-    setStorageError("SD E3 montar");
-    return false;
-  }
+  if (!sdMounted) return false;
 
   if (!SD_MMC.exists(DCIM_DIR)) {
     Serial.println("Criando pasta /DCIM");
     if (!SD_MMC.mkdir(DCIM_DIR)) {
       Serial.println("Falha ao criar /DCIM");
-      setStorageError("SD E5 criar DCIM");
       return false;
     }
   }
@@ -1419,115 +976,73 @@ void formatBytes(uint64_t bytes, char *out, size_t outSize) {
   }
 }
 
-struct SDFormatJob {
-  SemaphoreHandle_t finished;
-  esp_err_t result;
-};
-
-void formatSDWorker(void *parameter) {
-  SDFormatJob *job = static_cast<SDFormatJob *>(parameter);
-  esp_vfs_fat_mount_config_t formatConfig = {};
-  formatConfig.format_if_mount_failed = false;
-  formatConfig.max_files = SD_MAX_OPEN_FILES;
-  formatConfig.allocation_unit_size = SD_FORMAT_ALLOCATION_UNIT;
-  formatConfig.disk_status_check_enable = false;
-  formatConfig.use_one_fat = false;
-
-  job->result = esp_vfs_fat_sdcard_format_cfg("/sdcard", SD_MMC.cardHandle(),
-                                               &formatConfig);
-  xSemaphoreGive(job->finished);
-  vTaskDelete(nullptr);
-}
-
-bool formatMountedSDCard() {
-  if (!sdMounted || !SD_MMC.cardHandle()) {
-    setStorageError("SD E11 formatar");
+bool deleteRecursive(const char *path, bool removeSelf) {
+  fs::File root = SD_MMC.open(path);
+  if (!root) {
+    Serial.printf("Nao abriu para remover: %s\n", path);
     return false;
   }
 
-  SDFormatJob job = {};
-  job.finished = xSemaphoreCreateBinary();
-  job.result = ESP_FAIL;
-  if (!job.finished) {
-    Serial.println("Sem memoria para iniciar formatacao do SD.");
-    setStorageError("SD E12 memoria");
-    return false;
+  bool ok = true;
+
+  if (!root.isDirectory()) {
+    root.close();
+    return SD_MMC.remove(path);
   }
 
-  TaskHandle_t formatTask = nullptr;
-  BaseType_t created = xTaskCreate(
-    formatSDWorker, "pixie_sd_format", SD_FORMAT_TASK_STACK_SIZE,
-    &job, tskIDLE_PRIORITY + 1, &formatTask
-  );
+  fs::File file = root.openNextFile();
+  while (file) {
+    char childPath[96];
+    const char *name = file.name();
+    if (name[0] == '/') {
+      copyText(childPath, name, sizeof(childPath));
+    } else {
+      snprintf(childPath, sizeof(childPath), "%s/%s", path, name);
+    }
 
-  if (created != pdPASS) {
-    Serial.println("Falha ao criar tarefa de formatacao do SD.");
-    setStorageError("SD E12 memoria");
-    vSemaphoreDelete(job.finished);
-    return false;
+    bool isDir = file.isDirectory();
+    file.close();
+
+    if (isDir) {
+      if (!deleteRecursive(childPath, true)) ok = false;
+    } else {
+      Serial.printf("Removendo arquivo %s\n", childPath);
+      if (!SD_MMC.remove(childPath)) ok = false;
+    }
+
+    file = root.openNextFile();
+    yield();
   }
 
-  // O TFT permanece intocado enquanto a tarefa usa os pinos compartilhados.
-  // A espera curta devolve CPU ao sistema e evita watchdog durante cartoes
-  // grandes ou lentos.
-  while (xSemaphoreTake(job.finished, pdMS_TO_TICKS(50)) != pdTRUE) {
-    delay(1);
+  root.close();
+
+  if (removeSelf && strcmp(path, "/") != 0) {
+    Serial.printf("Removendo pasta %s\n", path);
+    if (!SD_MMC.rmdir(path)) ok = false;
   }
 
-  vSemaphoreDelete(job.finished);
-  Serial.printf("Resultado da formatacao FAT: %s (0x%x)\n",
-                esp_err_to_name(job.result), (unsigned)job.result);
-  if (job.result != ESP_OK) setStorageError("SD E11 formatar");
-  return job.result == ESP_OK;
+  return ok;
 }
 
 bool formatSDCard() {
   showCenteredMessage("Formatando...", "Aguarde", COLOR_WARN);
   Serial.println("Apagando conteudo do cartao SD.");
 
-  // Em um volume FAT montavel, use a API explicita de formatacao. Se o cartao
-  // estiver vazio ou com o sistema de arquivos corrompido, a primeira montagem
-  // falha; nesse caso a segunda tentativa usa format_if_mount_failed em uma
-  // tarefa dedicada, que particiona, formata e monta o cartao sem reiniciar.
-  bool mountedNormally = beginSDSession(false);
-  bool ok = false;
-
-  if (mountedNormally) {
-    ok = formatMountedSDCard();
-  } else {
-    showCenteredMessage("Recuperando SD", "Aguarde", COLOR_WARN);
-    Serial.println("Volume nao montavel; tentando particionar e formatar.");
-    ok = beginSDSession(false, true);
+  if (!beginSDSession()) {
+    showCenteredMessage("SD nao encontrado", "", COLOR_BAD);
+    return false;
   }
 
-  if (ok) {
-    ok = ensureDCIMFolder();
+  bool ok = deleteRecursive("/", false);
+  if (!SD_MMC.exists(DCIM_DIR)) {
+    ok = SD_MMC.mkdir(DCIM_DIR) && ok;
   }
 
+  nextPhotoNumber = 1;
   photoCount = 0;
+
   endSDSession();
-
-  // Confirme uma nova montagem antes de informar sucesso. Isso detecta falha
-  // de remount, cartao removido e formatacao que terminou sem volume utilizavel.
-  if (ok) {
-    showCenteredMessage("Verificando SD", "Aguarde", COLOR_TEXT);
-    bool verified = false;
-    if (beginSDSession(false)) {
-      verified = SD_MMC.cardType() != CARD_NONE &&
-                 SD_MMC.totalBytes() > 0 &&
-                 SD_MMC.exists(DCIM_DIR);
-      endSDSession();
-    }
-    ok = verified;
-    if (!verified && !lastStorageError) setStorageError("SD E13 verificar");
-  }
-
-  sdAvailable = ok;
-  if (ok) nextPhotoNumber = 1;
-  if (ok) clearStorageError();
-  showCenteredMessage(ok ? "SD formatado" : "Erro ao formatar",
-                      ok ? "/DCIM recriado" : storageErrorText(),
-                      ok ? COLOR_OK : COLOR_BAD);
+  showCenteredMessage(ok ? "SD formatado" : "Erro ao formatar", ok ? "/DCIM recriado" : "Veja o Serial", ok ? COLOR_OK : COLOR_BAD);
   delay(650);
   return ok;
 }
@@ -1562,9 +1077,7 @@ void loadPhotoList() {
 
   fs::File dir = SD_MMC.open(DCIM_DIR);
   if (!dir || !dir.isDirectory()) {
-    setStorageError("SD E15 listar");
     endSDSession();
-    sdAvailable = false;
     return;
   }
 
@@ -1601,91 +1114,10 @@ void *allocImageBuffer(size_t size) {
 }
 
 bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
-  if (jpegStretchToViewport) {
-    if (x < 0 || y < 0 || x >= jpegDecodedW || y >= jpegDecodedH) return true;
-
-    uint16_t sourceW = x + w > jpegDecodedW ? jpegDecodedW - x : w;
-    uint16_t sourceH = y + h > jpegDecodedH ? jpegDecodedH - y : h;
-    uint16_t orientedW = jpegRotateLeft ? jpegDecodedH : jpegDecodedW;
-
-    for (uint16_t sourceRow = 0; sourceRow < sourceH; sourceRow++) {
-      uint16_t sourceY = y + sourceRow;
-
-      for (uint16_t sourceCol = 0; sourceCol < sourceW; sourceCol++) {
-        uint16_t sourceX = x + sourceCol;
-        uint16_t rotatedX = jpegRotateLeft ? sourceY : sourceX;
-        uint16_t rotatedY = jpegRotateLeft ? jpegDecodedW - 1 - sourceX : sourceY;
-
-        if (jpegMirrorHorizontal) {
-          rotatedX = orientedW - 1 - rotatedX;
-        }
-
-        if (rotatedX < jpegCropX || rotatedX >= jpegCropX + jpegCropW ||
-            rotatedY < jpegCropY || rotatedY >= jpegCropY + jpegCropH) {
-          continue;
-        }
-
-        uint16_t croppedX = rotatedX - jpegCropX;
-        uint16_t croppedY = rotatedY - jpegCropY;
-        uint16_t destX0 = ((uint32_t)croppedX * jpegViewportW) / jpegCropW;
-        uint16_t destX1 = ((uint32_t)(croppedX + 1) * jpegViewportW) / jpegCropW;
-        uint16_t destY0 = ((uint32_t)croppedY * jpegViewportH) / jpegCropH;
-        uint16_t destY1 = ((uint32_t)(croppedY + 1) * jpegViewportH) / jpegCropH;
-
-        if (destX1 <= destX0 || destY1 <= destY0) continue;
-
-        uint16_t color = bitmap[sourceRow * w + sourceCol];
-        for (uint16_t destY = destY0; destY < destY1; destY++) {
-          uint16_t *dest = previewFrameBuffer + destY * jpegViewportW + destX0;
-          for (uint16_t destX = destX0; destX < destX1; destX++) {
-            *dest++ = color;
-          }
-        }
-      }
-    }
-
-    return true;
-  }
-
-  if (jpegRotateLeft) {
-    if (x >= jpegDecodedW || y >= jpegDecodedH) return true;
-
-    uint16_t sourceW = x + w > jpegDecodedW ? jpegDecodedW - x : w;
-    uint16_t sourceH = y + h > jpegDecodedH ? jpegDecodedH - y : h;
-    int16_t blockX = jpegDrawX + y;
-    int16_t blockY = jpegDrawY + jpegDecodedW - (x + sourceW);
-    int16_t viewXEnd = jpegViewportX + jpegViewportW;
-    int16_t viewYEnd = jpegViewportY + jpegViewportH;
-    int16_t clipX0 = blockX > jpegViewportX ? blockX : jpegViewportX;
-    int16_t clipX1 = blockX + sourceH < viewXEnd ? blockX + sourceH : viewXEnd;
-
-    if (clipX0 >= clipX1) return true;
-
-    for (uint16_t destRow = 0; destRow < sourceW; destRow++) {
-      int16_t screenY = blockY + destRow;
-      if (screenY < jpegViewportY || screenY >= viewYEnd) continue;
-
-      uint16_t sourceCol = sourceW - 1 - destRow;
-      uint16_t drawW = clipX1 - clipX0;
-      uint16_t firstSourceRow = clipX0 - blockX;
-
-      for (uint16_t col = 0; col < drawW; col++) {
-        uint16_t sourceRow = firstSourceRow + col;
-        lineBuffer[col] = bitmap[sourceRow * w + sourceCol];
-      }
-
-      tft.drawRGBBitmap(clipX0, screenY, lineBuffer, drawW, 1);
-    }
-
-    return true;
-  }
-
-  int16_t screenX = jpegDrawX + x;
-  int16_t screenY = jpegDrawY + y;
-  int16_t clipX0 = screenX > jpegViewportX ? screenX : jpegViewportX;
-  int16_t clipY0 = screenY > jpegViewportY ? screenY : jpegViewportY;
-  int16_t xEnd = screenX + (int16_t)w;
-  int16_t yEnd = screenY + (int16_t)h;
+  int16_t clipX0 = x > jpegViewportX ? x : jpegViewportX;
+  int16_t clipY0 = y > jpegViewportY ? y : jpegViewportY;
+  int16_t xEnd = x + (int16_t)w;
+  int16_t yEnd = y + (int16_t)h;
   int16_t viewXEnd = jpegViewportX + jpegViewportW;
   int16_t viewYEnd = jpegViewportY + jpegViewportH;
   int16_t clipX1 = xEnd < viewXEnd ? xEnd : viewXEnd;
@@ -1694,7 +1126,7 @@ bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitma
   if (clipX0 >= clipX1 || clipY0 >= clipY1) return true;
 
   for (int16_t row = clipY0; row < clipY1; row++) {
-    uint16_t *src = bitmap + (row - screenY) * w + (clipX0 - screenX);
+    uint16_t *src = bitmap + (row - y) * w + (clipX0 - x);
     uint16_t drawW = clipX1 - clipX0;
 
     for (uint16_t col = 0; col < drawW; col++) {
@@ -1709,8 +1141,7 @@ bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitma
 
 bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
                               int16_t areaX, int16_t areaY, int16_t areaW, int16_t areaH,
-                              bool clearArea, bool rotateLeft, bool mirrorHorizontal,
-                              bool stretchToViewport) {
+                              bool clearArea) {
   if (!jpegBuffer || fileSize == 0) return false;
 
   uint16_t jpgW = 0;
@@ -1722,21 +1153,15 @@ bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
   }
 
   uint8_t scale = 1;
-  uint16_t orientedW = rotateLeft ? jpgH : jpgW;
-  uint16_t orientedH = rotateLeft ? jpgW : jpgH;
-  bool isLivePreviewSize = jpgW == 160 && jpgH == 120;
-  if (!stretchToViewport || !isLivePreviewSize) {
-    while ((orientedW / scale > areaW || orientedH / scale > areaH) && scale < 8) {
-      scale *= 2;
-    }
+  while ((jpgW / scale > areaW || jpgH / scale > areaH * 2) && scale < 8) {
+    scale *= 2;
+  }
+  while (jpgW / scale > areaW && scale < 8) {
+    scale *= 2;
   }
 
-  jpegDecodedW = jpgW / scale;
-  jpegDecodedH = jpgH / scale;
-  uint16_t decodedOrientedW = rotateLeft ? jpegDecodedH : jpegDecodedW;
-  uint16_t decodedOrientedH = rotateLeft ? jpegDecodedW : jpegDecodedH;
-  int16_t drawW = decodedOrientedW;
-  int16_t drawH = decodedOrientedH;
+  int16_t drawW = jpgW / scale;
+  int16_t drawH = jpgH / scale;
   int16_t drawX = areaX + (areaW - drawW) / 2;
   int16_t drawY = areaY + (areaH - drawH) / 2;
 
@@ -1744,32 +1169,8 @@ bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
   jpegViewportY = areaY;
   jpegViewportW = areaW;
   jpegViewportH = areaH;
-  jpegDrawX = drawX;
-  jpegDrawY = drawY;
-  jpegRotateLeft = rotateLeft;
-  jpegMirrorHorizontal = mirrorHorizontal;
-  jpegStretchToViewport = stretchToViewport;
-  jpegCropX = 0;
-  jpegCropY = 0;
-  jpegCropW = decodedOrientedW;
-  jpegCropH = decodedOrientedH;
 
-  if (stretchToViewport) {
-    if ((uint32_t)decodedOrientedW * areaH > (uint32_t)decodedOrientedH * areaW) {
-      jpegCropW = ((uint32_t)decodedOrientedH * areaW) / areaH;
-      jpegCropX = (decodedOrientedW - jpegCropW) / 2;
-    } else {
-      jpegCropH = ((uint32_t)decodedOrientedW * areaH) / areaW;
-      jpegCropY = (decodedOrientedH - jpegCropH) / 2;
-    }
-  }
-
-  if (stretchToViewport) {
-    uint32_t pixelCount = (uint32_t)areaW * areaH;
-    for (uint32_t i = 0; i < pixelCount; i++) {
-      previewFrameBuffer[i] = COLOR_BG;
-    }
-  } else if (clearArea) {
+  if (clearArea) {
     tft.fillRect(areaX, areaY, areaW, areaH, COLOR_BG);
   }
 
@@ -1777,14 +1178,10 @@ bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
   TJpgDec.setSwapBytes(false);
   TJpgDec.setCallback(tftJpegOutput);
 
-  JRESULT drawResult = TJpgDec.drawJpg(0, 0, jpegBuffer, fileSize);
+  JRESULT drawResult = TJpgDec.drawJpg(drawX, drawY, jpegBuffer, fileSize);
   if (drawResult != JDR_OK) {
     Serial.printf("Falha ao desenhar JPEG: %d\n", drawResult);
     return false;
-  }
-
-  if (stretchToViewport) {
-    tft.drawRGBBitmap(areaX, areaY, previewFrameBuffer, areaW, areaH);
   }
 
   return true;
@@ -1862,7 +1259,7 @@ bool drawBmpFromBuffer(const uint8_t *bmpBuffer, size_t fileSize, const char *pa
 
 void showPhoto(int index) {
   if (!sdAvailable) {
-    showCenteredMessage("SD indisponivel", storageErrorText(), COLOR_WARN);
+    showCenteredMessage("SD nao encontrado", "", COLOR_WARN);
     return;
   }
 
@@ -1877,7 +1274,7 @@ void showPhoto(int index) {
   copyText(path, photos[index].path, sizeof(path));
 
   if (!beginSDSession()) {
-    showCenteredMessage("SD indisponivel", storageErrorText(), COLOR_WARN);
+    showCenteredMessage("SD nao encontrado", "", COLOR_WARN);
     return;
   }
 
@@ -1921,9 +1318,7 @@ void showPhoto(int index) {
   }
 
   tft.fillScreen(COLOR_BG);
-  bool drawResult = drawJpegBufferToViewport(jpegBuffer, fileSize, 0, 0, SCREEN_W, SCREEN_H,
-                                             false, CAMERA_DISPLAY_ROTATE_LEFT,
-                                             CAMERA_DISPLAY_MIRROR_HORIZONTAL, true);
+  bool drawResult = drawJpegBufferToViewport(jpegBuffer, fileSize, 0, 0, SCREEN_W, SCREEN_H, false);
   heap_caps_free(jpegBuffer);
 
   if (!drawResult) {
@@ -1972,13 +1367,13 @@ void drawIcon(uint8_t icon, int16_t x, int16_t y, uint16_t color) {
   }
 }
 
-int16_t animatedRowY(uint8_t current, uint8_t previous, uint8_t rowHeight) {
-  int16_t targetY = 18 + current * rowHeight;
+int16_t animatedRowY(uint8_t current, uint8_t previous) {
+  int16_t targetY = 18 + current * 14;
   if (current == previous || millis() - menuAnimStartMs >= menuAnimMs) {
     return targetY;
   }
 
-  int16_t startY = 18 + previous * rowHeight;
+  int16_t startY = 18 + previous * 14;
   unsigned long elapsed = millis() - menuAnimStartMs;
   return startY + ((targetY - startY) * (int16_t)elapsed) / (int16_t)menuAnimMs;
 }
@@ -1987,59 +1382,31 @@ void drawListMenu(const char *title, const char **items, uint8_t count, uint8_t 
   tft.fillScreen(COLOR_BG);
   drawHeader(title);
 
-  uint8_t rowHeight = mainMenu ? 15 : 12;
-  int16_t highlightY = animatedRowY(selected, previous, rowHeight);
-  int8_t highlightOffset = mainMenu ? 0 : 0;
-  uint8_t highlightHeight = mainMenu ? 14 : 11;
-  tft.fillRoundRect(4, highlightY + highlightOffset, 148, highlightHeight, 4, COLOR_PANEL_2);
-  tft.fillRoundRect(4, highlightY + highlightOffset, 4, highlightHeight, 2, COLOR_ACCENT);
-  tft.drawFastVLine(150, highlightY + 3, highlightHeight - 6, COLOR_ACCENT);
+  int16_t highlightY = animatedRowY(selected, previous);
+  tft.fillRoundRect(4, highlightY - 2, 152, 13, 4, COLOR_PANEL_2);
+  tft.drawRoundRect(4, highlightY - 2, 152, 13, 4, COLOR_ACCENT);
 
   for (uint8_t i = 0; i < count; i++) {
-    int16_t y = 18 + i * rowHeight;
+    int16_t y = 18 + i * 14;
     bool isSelected = i == selected;
     uint16_t color = isSelected ? COLOR_TEXT : COLOR_MUTED;
 
     if (mainMenu) {
-      if (isSelected) {
-        tft.fillRoundRect(10, y + 1, 18, 12, 3, COLOR_PANEL);
-      }
-      drawIcon(i, 12, y, isSelected ? COLOR_ACCENT : COLOR_MUTED);
-      tft.setCursor(36, y + 4);
+      drawIcon(i, 10, y - 2, isSelected ? COLOR_ACCENT : COLOR_MUTED);
+      tft.setCursor(32, y + 1);
     } else {
-      tft.fillCircle(15, y + 5, isSelected ? 3 : 2, isSelected ? COLOR_ACCENT : COLOR_PANEL_2);
-      if (isSelected) tft.drawCircle(15, y + 5, 4, COLOR_ACCENT);
-      tft.setCursor(26, y + 2);
+      tft.fillCircle(16, y + 4, isSelected ? 3 : 2, isSelected ? COLOR_ACCENT : COLOR_MUTED);
+      tft.setCursor(28, y + 1);
     }
 
     tft.setTextSize(1);
     tft.setTextColor(color);
     tft.print(items[i]);
-
-    if (!isSelected && i + 1 < count) {
-      tft.drawFastHLine(mainMenu ? 36 : 26, y + rowHeight - 1,
-                        mainMenu ? 108 : 118, COLOR_PANEL);
-    }
   }
 
-  for (uint8_t i = 0; i < count; i++) {
-    uint16_t dotColor = i == selected ? COLOR_ACCENT : COLOR_PANEL_2;
-    int16_t dotY = 18 + i * rowHeight + rowHeight / 2;
-    tft.fillCircle(156, dotY, i == selected ? 2 : 1, dotColor);
-  }
-}
-
-void setStorageError(const char *errorCode) {
-  lastStorageError = errorCode;
-  Serial.printf("Falha de armazenamento: %s\n", errorCode ? errorCode : "desconhecida");
-}
-
-void clearStorageError() {
-  lastStorageError = nullptr;
-}
-
-const char *storageErrorText() {
-  return lastStorageError ? lastStorageError : "SD E0 desconhec.";
+  tft.fillRect(136, 20, 4, 48, COLOR_PANEL);
+  int16_t posY = 20 + (selected * 48) / count;
+  tft.fillRect(136, posY, 4, 10, COLOR_ACCENT);
 }
 
 void drawCameraScreen() {
@@ -2061,39 +1428,31 @@ void drawMainMenu() {
 }
 
 void drawSettingsMenu() {
-  drawListMenu("Configuracoes", settingsItems, 5, settingsIndex, previousSettingsIndex, false);
+  drawListMenu("Configuracoes", settingsItems, 4, settingsIndex, previousSettingsIndex, false);
 }
 
 void drawSDInfo() {
-  bool cardReady = false;
-  uint8_t type = CARD_NONE;
-  uint16_t storedPhotos = 0;
-  char totalText[18] = "-";
-  char usedText[18] = "-";
-  char freeText[18] = "-";
-
-  if (beginSDSession(true)) {
-    uint64_t total = SD_MMC.totalBytes();
-    uint64_t used = SD_MMC.usedBytes();
-    uint64_t freeBytes = total > used ? total - used : 0;
-    type = SD_MMC.cardType();
-    storedPhotos = countPhotosOnMountedSD();
-    scanNextPhotoNumber();
-    formatBytes(total, totalText, sizeof(totalText));
-    formatBytes(used, usedText, sizeof(usedText));
-    formatBytes(freeBytes, freeText, sizeof(freeText));
-    cardReady = true;
-    endSDSession();
-  }
-
-  // Desenhe somente depois de devolver GPIO14/15/2 ao TFT/botoes.
   tft.fillScreen(COLOR_BG);
   drawHeader("Cartao SD");
 
-  if (!cardReady) {
+  if (!beginSDSession(true)) {
     tft.setTextSize(1);
-    centerText(storageErrorText(), 38, COLOR_WARN, 1);
+    centerText("SD nao encontrado", 38, COLOR_WARN, 1);
   } else {
+    uint64_t total = SD_MMC.totalBytes();
+    uint64_t used = SD_MMC.usedBytes();
+    uint64_t freeBytes = total > used ? total - used : 0;
+    uint8_t type = SD_MMC.cardType();
+    uint16_t storedPhotos = countPhotosOnMountedSD();
+    scanNextPhotoNumber();
+
+    char totalText[18];
+    char usedText[18];
+    char freeText[18];
+    formatBytes(total, totalText, sizeof(totalText));
+    formatBytes(used, usedText, sizeof(usedText));
+    formatBytes(freeBytes, freeText, sizeof(freeText));
+
     tft.setTextSize(1);
     tft.setTextColor(COLOR_TEXT);
     tft.setCursor(4, 22);
@@ -2113,6 +1472,8 @@ void drawSDInfo() {
     tft.setCursor(86, 46);
     tft.print("Fotos: ");
     tft.print(storedPhotos);
+
+    endSDSession();
   }
 
   const char *options[] = {"Formatar", "Voltar"};
@@ -2172,7 +1533,7 @@ void drawAbout() {
 
 void drawGallery() {
   if (!sdAvailable) {
-    showCenteredMessage("SD indisponivel", storageErrorText(), COLOR_WARN);
+    showCenteredMessage("SD nao encontrado", "", COLOR_WARN);
     return;
   }
 
@@ -2220,75 +1581,32 @@ void drawFormatConfirmation() {
   }
 }
 
-void drawResetConfirmation() {
-  tft.fillScreen(COLOR_BG);
-  drawHeader("Reset config");
-  centerText("Apagar configuracoes?", 30, COLOR_WARN, 1);
-
-  const char *options[] = {"Sim", "Nao"};
-  for (uint8_t i = 0; i < 2; i++) {
-    int16_t x = i == 0 ? 44 : 86;
-    bool selected = i == confirmIndex;
-    tft.drawRoundRect(x, 48, 34, 20, 5, selected ? (i == 0 ? COLOR_WARN : COLOR_ACCENT) : COLOR_MUTED);
-    if (selected) tft.fillRoundRect(x + 2, 50, 30, 16, 4, i == 0 ? COLOR_WARN : COLOR_PANEL_2);
-    tft.setTextSize(1);
-    tft.setTextColor(selected ? COLOR_TEXT : COLOR_MUTED);
-    tft.setCursor(x + 8, 55);
-    tft.print(options[i]);
-  }
-}
-
 void showCaptureAnimation() {
-  tft.drawRoundRect(3, 3, SCREEN_W - 6, SCREEN_H - 6, 5, COLOR_ACCENT);
+  tft.drawRoundRect(8, 8, 144, 64, 4, COLOR_ACCENT);
+  delay(12);
+  tft.drawRoundRect(20, 16, 120, 48, 4, COLOR_ACCENT);
+  delay(12);
   tft.fillScreen(ST77XX_WHITE);
-  delay(6);
+  delay(18);
   drawCameraScreen();
 }
 
 void mostrarFrame(camera_fb_t *fb) {
   if (!fb || fb->format != PIXFORMAT_RGB565 || fb->width < SCREEN_W || fb->height < SCREEN_H) return;
 
-  uint16_t *src = (uint16_t *)fb->buf;
-#if CAMERA_DISPLAY_ROTATE_LEFT
-  uint16_t orientedW = fb->height;
-  uint16_t orientedH = fb->width;
-#else
-  uint16_t orientedW = fb->width;
-  uint16_t orientedH = fb->height;
-#endif
-  uint16_t cropX = 0;
-  uint16_t cropY = 0;
-  uint16_t cropW = orientedW;
-  uint16_t cropH = orientedH;
+  int cropTop = ((int)fb->height - SCREEN_H) / 2;
+  if (cropTop < 0) cropTop = 0;
 
-  if ((uint32_t)orientedW * SCREEN_H > (uint32_t)orientedH * SCREEN_W) {
-    cropW = ((uint32_t)orientedH * SCREEN_W) / SCREEN_H;
-    cropX = (orientedW - cropW) / 2;
-  } else {
-    cropH = ((uint32_t)orientedW * SCREEN_H) / SCREEN_W;
-    cropY = (orientedH - cropH) / 2;
-  }
+  for (int y = 0; y < SCREEN_H; y++) {
+    int sourceY = y + cropTop;
+    uint16_t *src = (uint16_t *)(fb->buf + sourceY * fb->width * 2);
 
-  for (uint16_t y = 0; y < SCREEN_H; y++) {
-    for (uint16_t x = 0; x < SCREEN_W; x++) {
-      uint16_t orientedX = cropX + ((uint32_t)x * cropW) / SCREEN_W;
-      uint16_t orientedY = cropY + ((uint32_t)y * cropH) / SCREEN_H;
-#if CAMERA_DISPLAY_MIRROR_HORIZONTAL
-      orientedX = orientedW - 1 - orientedX;
-#endif
-#if CAMERA_DISPLAY_ROTATE_LEFT
-      uint16_t sourceX = fb->width - 1 - orientedY;
-      uint16_t sourceY = orientedX;
-#else
-      uint16_t sourceX = orientedX;
-      uint16_t sourceY = orientedY;
-#endif
-      previewFrameBuffer[y * SCREEN_W + x] =
-        swapRB(__builtin_bswap16(src[sourceY * fb->width + sourceX]));
+    for (int x = 0; x < SCREEN_W; x++) {
+      lineBuffer[x] = swapRB(__builtin_bswap16(src[x]));
     }
-  }
 
-  tft.drawRGBBitmap(0, 0, previewFrameBuffer, SCREEN_W, SCREEN_H);
+    tft.drawRGBBitmap(0, y, lineBuffer, SCREEN_W, 1);
+  }
 }
 
 void updateCameraPreview() {
@@ -2296,12 +1614,6 @@ void updateCameraPreview() {
   if (!cameraLigada || cameraMode != CAMERA_PREVIEW_JPEG) return;
 
   unsigned long now = millis();
-  // Nao deixe o proximo quadro apagar imediatamente o resultado da captura.
-  // A mensagem permanece legivel pelo tempo solicitado em showStatus().
-  if (messageUntilMs) {
-    if ((long)(messageUntilMs - now) > 0) return;
-    messageUntilMs = 0;
-  }
   if (now - lastCameraFrameMs < cameraFrameIntervalMs) return;
   lastCameraFrameMs = now;
 
@@ -2312,21 +1624,16 @@ void updateCameraPreview() {
     return;
   }
 
-  bool previewDrawn = false;
   if (fb->format == PIXFORMAT_JPEG && fb->len > 0) {
-    previewDrawn = drawJpegBufferToViewport(fb->buf, fb->len, 0, 0, SCREEN_W, SCREEN_H,
-                                            false, CAMERA_DISPLAY_ROTATE_LEFT,
-                                            CAMERA_DISPLAY_MIRROR_HORIZONTAL, true);
+    drawJpegBufferToViewport(fb->buf, fb->len, 0, 0, SCREEN_W, SCREEN_H, false);
   } else {
     mostrarFrame(fb);
-    previewDrawn = true;
   }
   esp_camera_fb_return(fb);
 
-  if (previewDrawn && cameraBootGuard == CAMERA_BOOT_GUARD_MAGIC) {
-    cameraBootGuard = 0;
+  if (messageUntilMs && now > messageUntilMs) {
+    messageUntilMs = 0;
   }
-
 }
 
 bool getNextAvailablePhotoPath(char *path, size_t pathSize) {
@@ -2376,65 +1683,34 @@ bool writeBuffered(fs::File &file, const uint8_t *data, size_t len, size_t *tota
 }
 
 bool writeJpegToSD(const char *photoPath, const uint8_t *jpegData, size_t jpegLen, size_t *savedBytes) {
-  if (!jpegData || jpegLen == 0) {
-    setStorageError("SD E14 JPEG vazio");
+  if (!jpegData || jpegLen == 0) return false;
+
+  fs::File photoFile = SD_MMC.open(photoPath, FILE_WRITE, true);
+  if (!photoFile) {
+    Serial.printf("Falha ao abrir %s para escrita JPEG.\n", photoPath);
     return false;
   }
 
-  for (uint8_t attempt = 0; attempt < 2; attempt++) {
+  size_t writtenTotal = 0;
+  bool ok = writeBuffered(photoFile, jpegData, jpegLen, &writtenTotal);
+  photoFile.flush();
+  photoFile.close();
+
+  if (savedBytes) *savedBytes = writtenTotal;
+
+  fs::File verifyFile = SD_MMC.open(photoPath, FILE_READ);
+  size_t verifySize = verifyFile ? verifyFile.size() : 0;
+  if (verifyFile) verifyFile.close();
+
+  Serial.printf("Verificacao JPEG %s: escrito=%u salvo=%u esperado=%u\n",
+                photoPath, (unsigned)writtenTotal, (unsigned)verifySize, (unsigned)jpegLen);
+
+  if (!ok || writtenTotal != jpegLen || verifySize != jpegLen) {
     SD_MMC.remove(photoPath);
-    fs::File photoFile = SD_MMC.open(photoPath, FILE_WRITE, true);
-    if (!photoFile) {
-      Serial.printf("Falha ao abrir %s para escrita JPEG (tentativa %u).\n",
-                    photoPath, attempt + 1);
-      setStorageError("SD E6 abrir");
-      delay(25);
-      continue;
-    }
-
-    size_t writtenTotal = 0;
-    bool ok = writeBuffered(photoFile, jpegData, jpegLen, &writtenTotal);
-    photoFile.flush();
-    photoFile.close();
-
-    fs::File verifyFile = SD_MMC.open(photoPath, FILE_READ);
-    size_t verifySize = verifyFile ? verifyFile.size() : 0;
-    if (verifyFile) verifyFile.close();
-
-    Serial.printf("Verificacao JPEG %s: escrito=%u salvo=%u esperado=%u tentativa=%u\n",
-                  photoPath, (unsigned)writtenTotal, (unsigned)verifySize,
-                  (unsigned)jpegLen, attempt + 1);
-
-    if (ok && writtenTotal == jpegLen && verifySize == jpegLen) {
-      if (savedBytes) *savedBytes = writtenTotal;
-      clearStorageError();
-      return true;
-    }
-
-    if (!ok || writtenTotal != jpegLen) {
-      setStorageError("SD E7 gravar");
-    } else {
-      setStorageError("SD E8 conferir");
-    }
-
-    SD_MMC.remove(photoPath);
-    delay(35);
+    return false;
   }
 
-  if (savedBytes) *savedBytes = 0;
-  return false;
-}
-
-bool writeJpegWithSDRecovery(const char *photoPath, const uint8_t *jpegData,
-                             size_t jpegLen, size_t *savedBytes) {
-  if (writeJpegToSD(photoPath, jpegData, jpegLen, savedBytes)) return true;
-
-  Serial.println("Reiniciando barramento SD para nova tentativa de gravacao.");
-  endSDSession();
-  delay(60);
-
-  if (!beginSDSession() || !ensureDCIMFolder()) return false;
-  return writeJpegToSD(photoPath, jpegData, jpegLen, savedBytes);
+  return true;
 }
 
 bool writeBmpFromPreviewFrame(const char *photoPath, const uint8_t *rgb565Frame, size_t frameLen, size_t *savedBytes) {
@@ -2522,109 +1798,31 @@ bool writeBmpFromPreviewFrame(const char *photoPath, const uint8_t *rgb565Frame,
   return true;
 }
 
-bool readJpegDimensions(const uint8_t *data, size_t length, uint16_t *width, uint16_t *height) {
-  if (!data || length < 12 || data[0] != 0xFF || data[1] != 0xD8) return false;
-
-  size_t offset = 2;
-  while (offset + 8 < length) {
-    while (offset < length && data[offset] != 0xFF) offset++;
-    while (offset < length && data[offset] == 0xFF) offset++;
-    if (offset >= length) break;
-
-    uint8_t marker = data[offset++];
-    if (marker == 0xD9 || marker == 0xDA) break;
-    if (marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
-    if (offset + 1 >= length) return false;
-
-    uint16_t segmentLength = ((uint16_t)data[offset] << 8) | data[offset + 1];
-    if (segmentLength < 2 || offset + segmentLength > length) return false;
-
-    bool isSof = marker >= 0xC0 && marker <= 0xCF &&
-                 marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
-    if (isSof && segmentLength >= 7) {
-      *height = ((uint16_t)data[offset + 3] << 8) | data[offset + 4];
-      *width = ((uint16_t)data[offset + 5] << 8) | data[offset + 6];
-      return *width > 0 && *height > 0;
-    }
-
-    offset += segmentLength;
-  }
-
-  return false;
-}
-
-bool jpegHasEndMarker(const uint8_t *data, size_t length) {
-  if (!data || length < 4) return false;
-  size_t first = length > 64 ? length - 64 : 2;
-  for (size_t i = length - 1; i > first; i--) {
-    if (data[i - 1] == 0xFF && data[i] == 0xD9) return true;
-  }
-  return false;
-}
-
 bool isExpectedCaptureSize(camera_fb_t *fb) {
-  if (!fb || fb->format != PIXFORMAT_JPEG || fb->len == 0 ||
-      !jpegHasEndMarker(fb->buf, fb->len)) return false;
-
-  uint16_t jpegW = 0;
-  uint16_t jpegH = 0;
-  if (!readJpegDimensions(fb->buf, fb->len, &jpegW, &jpegH)) return false;
+  if (!fb) return false;
 
   uint16_t expectedW = frameSizeWidth(activeSensorFrameSize);
   uint16_t expectedH = frameSizeHeight(activeSensorFrameSize);
   if (expectedW == 0 || expectedH == 0) return true;
 
-  return jpegW >= expectedW && jpegH >= expectedH;
-}
-
-camera_fb_t *takeCameraFrame(uint32_t timeoutMs) {
-  unsigned long startedAt = millis();
-  do {
-    // Este e o caminho de captura usado pelos exemplos oficiais. Consultar
-    // apenas available_frames() pode perder a transicao do primeiro quadro
-    // logo depois de mudar resolucao/qualidade no OV2640.
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (fb) return fb;
-    delay(4);
-  } while (millis() - startedAt < timeoutMs);
-  return nullptr;
-}
-
-bool warmUpCaptureSensor() {
-  camera_fb_t *fb = nullptr;
-#if CAPTURE_WARMUP_FRAMES > 0
-  for (uint8_t warmup = 0; warmup < CAPTURE_WARMUP_FRAMES; warmup++) {
-    fb = takeCameraFrame(CAPTURE_FRAME_READY_TIMEOUT_MS);
-    if (!fb) {
-      Serial.println("Camera nao entregou quadro de aquecimento.");
-      return false;
-    }
-    Serial.printf("Aquecimento captura: %ux%u formato=%d len=%u\n",
-                  (unsigned)fb->width, (unsigned)fb->height, fb->format, (unsigned)fb->len);
-    esp_camera_fb_return(fb);
-    delay(25);
-  }
-#endif
-  return true;
+  return fb->width >= expectedW && fb->height >= expectedH;
 }
 
 camera_fb_t *captureJpegFrameForPhoto() {
-  digitalWrite(FLASH_PIN, LOW);
-  if (!warmUpCaptureSensor()) return nullptr;
-
   camera_fb_t *fb = nullptr;
 
-  for (uint8_t attempt = 0; attempt < 5; attempt++) {
-    // Acenda o flash somente ao redor do quadro que sera aproveitado. Mantê-lo
-    // ligado durante aquecimento/reconfiguracao causava pico de corrente longo
-    // e podia derrubar a alimentacao antes de o SD ser montado.
-    if (flashEnabled) {
-      digitalWrite(FLASH_PIN, HIGH);
-      delay(150);
-    }
+  for (uint8_t warmup = 0; warmup < CAPTURE_WARMUP_FRAMES; warmup++) {
+    fb = esp_camera_fb_get();
+    if (!fb) return nullptr;
+    Serial.printf("Aquecimento captura: %ux%u formato=%d len=%u\n",
+                  (unsigned)fb->width, (unsigned)fb->height, fb->format, (unsigned)fb->len);
+    esp_camera_fb_return(fb);
+    fb = nullptr;
+    delay(30);
+  }
 
-    fb = takeCameraFrame(CAPTURE_FRAME_READY_TIMEOUT_MS);
-    digitalWrite(FLASH_PIN, LOW);
+  for (uint8_t attempt = 0; attempt < 5; attempt++) {
+    fb = esp_camera_fb_get();
     if (!fb) {
       return nullptr;
     }
@@ -2638,18 +1836,10 @@ camera_fb_t *captureJpegFrameForPhoto() {
                   frameSizeName(activeSensorFrameSize));
     esp_camera_fb_return(fb);
     fb = nullptr;
-    delay(2);
+    delay(35);
   }
 
   return nullptr;
-}
-
-framesize_t captureRecoveryFrameSize(framesize_t currentSize) {
-  uint16_t width = frameSizeWidth(currentSize);
-  if (width > 800) return FRAMESIZE_SVGA;
-  if (width > 640) return FRAMESIZE_VGA;
-  if (width > 320) return FRAMESIZE_QVGA;
-  return currentSize;
 }
 
 bool captureAndSavePhoto() {
@@ -2660,134 +1850,90 @@ bool captureAndSavePhoto() {
   logHeap("antes-captura");
 
   if (!initializeCamera(CAMERA_CAPTURE_JPEG)) {
+    showStatus("Falha camera", COLOR_BAD, 1200);
     initializeCamera(CAMERA_PREVIEW_JPEG);
     drawCameraScreen();
-    showStatus("CAM E1 iniciar", COLOR_BAD, 2200);
     return false;
   }
 
+  if (flashEnabled) {
+    digitalWrite(FLASH_PIN, HIGH);
+    delay(90);
+  }
+
   camera_fb_t *fb = captureJpegFrameForPhoto();
-
-  if (!fb) {
-    if (setCameraFrameProfile(activeSensorFrameSize, CAMERA_CAPTURE_FALLBACK_QUALITY,
-                              CAMERA_CAPTURE_JPEG, CAPTURE_SENSOR_SETTLE_MS)) {
-      Serial.printf("Qualidade %u nao gerou quadro completo; tentando qualidade %u.\n",
-                    CAMERA_CAPTURE_JPEG_QUALITY, CAMERA_CAPTURE_FALLBACK_QUALITY);
-      fb = captureJpegFrameForPhoto();
-    }
-  }
-
-  if (!fb) {
-    framesize_t recoverySize = captureRecoveryFrameSize(activeSensorFrameSize);
-    if (recoverySize != activeSensorFrameSize &&
-        setCameraFrameProfile(recoverySize, CAMERA_CAPTURE_FALLBACK_QUALITY,
-                              CAMERA_CAPTURE_JPEG, CAPTURE_SENSOR_SETTLE_MS)) {
-      Serial.printf("Recuperacao de captura: tentando %s qualidade %u.\n",
-                    frameSizeName(recoverySize), CAMERA_CAPTURE_FALLBACK_QUALITY);
-      fb = captureJpegFrameForPhoto();
-    }
-  }
+  digitalWrite(FLASH_PIN, LOW);
 
   if (!fb) {
     Serial.println("Falha ao obter framebuffer JPEG para foto.");
+    showStatus("Falha camera", COLOR_BAD, 1200);
     initializeCamera(CAMERA_PREVIEW_JPEG);
     drawCameraScreen();
-    showStatus("CAM E2 JPEG", COLOR_BAD, 2200);
     return false;
   }
 
   if (fb->format != PIXFORMAT_JPEG || fb->len == 0) {
     Serial.printf("Framebuffer invalido para foto. formato=%d len=%u\n", fb->format, (unsigned)fb->len);
     esp_camera_fb_return(fb);
+    showStatus("JPEG invalido", COLOR_BAD, 1200);
     initializeCamera(CAMERA_PREVIEW_JPEG);
     drawCameraScreen();
-    showStatus("CAM E3 invalido", COLOR_BAD, 2200);
     return false;
   }
 
-  size_t jpegLength = fb->len;
-  uint16_t capturedWidth = fb->width;
-  uint16_t capturedHeight = fb->height;
-  uint8_t *jpegCopy = (uint8_t *)allocImageBuffer(jpegLength);
-
-  if (!jpegCopy) {
-    Serial.printf("Sem memoria para isolar JPEG de %u bytes antes do SD.\n", (unsigned)jpegLength);
-    esp_camera_fb_return(fb);
-    initializeCamera(CAMERA_PREVIEW_JPEG);
-    drawCameraScreen();
-    showStatus("CAM E4 memoria", COLOR_BAD, 2200);
-    return false;
-  }
-
-  memcpy(jpegCopy, fb->buf, jpegLength);
-  esp_camera_fb_return(fb);
-  fb = nullptr;
-
-  // Interrompe I2S/DMA e libera os framebuffers antes de entregar o barramento
-  // compartilhado ao SD. O JPEG ja esta preservado integralmente na PSRAM.
-  desligarCamera();
-
-  Serial.printf("JPEG isolado: %ux%u %u bytes\n",
-                (unsigned)capturedWidth, (unsigned)capturedHeight, (unsigned)jpegLength);
+  Serial.printf("JPEG capturado: %ux%u %u bytes\n", (unsigned)fb->width, (unsigned)fb->height, (unsigned)fb->len);
   showStatus("Salvando SD", COLOR_TEXT, 500);
 
   if (!beginSDSession()) {
-    heap_caps_free(jpegCopy);
+    esp_camera_fb_return(fb);
+    showStatus("SD nao encontrado", COLOR_WARN, 1400);
     initializeCamera(CAMERA_PREVIEW_JPEG);
     drawCameraScreen();
-    showStatus(storageErrorText(), COLOR_WARN, 2400);
     return false;
   }
 
   bool ok = false;
-  const char *failureStatus = nullptr;
   char photoPath[PHOTO_PATH_LEN];
 
   if (!ensureDCIMFolder()) {
-    failureStatus = storageErrorText();
+    showStatus("Erro /DCIM", COLOR_BAD, 1400);
   } else {
     scanNextPhotoNumber();
     if (!getNextAvailablePhotoPath(photoPath, sizeof(photoPath))) {
-      setStorageError("SD E10 nome");
-      failureStatus = storageErrorText();
+      showStatus("Nome indispon.", COLOR_BAD, 1400);
     } else {
       uint64_t total = SD_MMC.totalBytes();
       uint64_t used = SD_MMC.usedBytes();
       uint64_t freeBytes = total > used ? total - used : 0;
       Serial.printf("SD pronto para escrita. Total=%llu Usado=%llu Livre=%llu Arquivo=%s Tamanho=%u\n",
-                    total, used, freeBytes, photoPath, (unsigned)jpegLength);
+                    total, used, freeBytes, photoPath, (unsigned)fb->len);
 
-      if (freeBytes > 0 && freeBytes < jpegLength + 4096) {
+      if (freeBytes > 0 && freeBytes < fb->len + 4096) {
         Serial.println("Espaco insuficiente no SD.");
-        setStorageError("SD E9 cheio");
-        failureStatus = storageErrorText();
+        showStatus("Espaco insuf.", COLOR_BAD, 1400);
       } else {
         size_t savedBytes = 0;
-        if (writeJpegWithSDRecovery(photoPath, jpegCopy, jpegLength, &savedBytes)) {
+        if (writeJpegToSD(photoPath, fb->buf, fb->len, &savedBytes)) {
           Serial.printf("Foto JPEG salva: %s (%u bytes)\n", photoPath, (unsigned)savedBytes);
           nextPhotoNumber++;
           ok = true;
         } else {
           Serial.println("Falha ao salvar JPEG.");
-          failureStatus = storageErrorText();
+          showStatus("Erro salvar", COLOR_BAD, 1400);
         }
       }
     }
   }
 
   endSDSession();
-  heap_caps_free(jpegCopy);
+  esp_camera_fb_return(fb);
   initializeCamera(CAMERA_PREVIEW_JPEG);
   drawCameraScreen();
 
   if (ok) {
     char msg[18];
     snprintf(msg, sizeof(msg), "Salva %04u", nextPhotoNumber - 1);
-    showStatus(msg, COLOR_OK, 1800);
-  } else if (failureStatus) {
-    // O TFT compartilha GPIO14/15 com o SD. Mensagens so podem ser desenhadas
-    // depois que endSDSession() devolveu o barramento ao display.
-    showStatus(failureStatus, COLOR_BAD, 2400);
+    showStatus(msg, COLOR_OK, 1200);
   }
 
   logHeap("apos-captura");
@@ -2816,7 +1962,6 @@ void setAppState(AppState newState) {
       sdInfoIndex = 1;
       break;
     case STATE_SD_FORMAT_CONFIRM:
-    case STATE_RESET_CONFIRM:
     case STATE_POWER_CONFIRM:
       confirmIndex = 1;
       break;
@@ -2842,7 +1987,7 @@ void moveMainMenu(int8_t delta) {
 
 void moveSettingsMenu(int8_t delta) {
   previousSettingsIndex = settingsIndex;
-  settingsIndex = (settingsIndex + 5 + delta) % 5;
+  settingsIndex = (settingsIndex + 4 + delta) % 4;
   menuAnimStartMs = millis();
   uiDirty = true;
 }
@@ -2875,9 +2020,6 @@ void selectSettingsMenu() {
       break;
     case 2:
       setAppState(STATE_ABOUT);
-      break;
-    case 3:
-      setAppState(STATE_RESET_CONFIRM);
       break;
     default:
       setAppState(STATE_MAIN_MENU);
@@ -2945,28 +2087,6 @@ void handleButtonEvent(ButtonEvent event) {
         setAppState(STATE_SD_INFO);
       } else if (event.type == EVT_OK_LONG) {
         setAppState(STATE_SD_INFO);
-      }
-      break;
-
-    case STATE_RESET_CONFIRM:
-      if (event.type == EVT_UP || event.type == EVT_DOWN) {
-        confirmIndex = confirmIndex == 0 ? 1 : 0;
-        uiDirty = true;
-      } else if (event.type == EVT_OK_SHORT) {
-        if (confirmIndex == 0) {
-          bool cleared = preferences.clear();
-          showCenteredMessage(cleared ? "Config resetada" : "Falha no reset",
-                              cleared ? "Reiniciando..." : "Tente novamente",
-                              cleared ? COLOR_OK : COLOR_BAD);
-          delay(700);
-          if (cleared) {
-            preferences.end();
-            ESP.restart();
-          }
-        }
-        setAppState(STATE_SETTINGS);
-      } else if (event.type == EVT_OK_LONG) {
-        setAppState(STATE_SETTINGS);
       }
       break;
 
@@ -3043,9 +2163,6 @@ void updateInterface() {
       break;
     case STATE_SD_FORMAT_CONFIRM:
       drawFormatConfirmation();
-      break;
-    case STATE_RESET_CONFIRM:
-      drawResetConfirmation();
       break;
     case STATE_FLASH_SETTINGS:
       drawFlashSettings();
@@ -3135,7 +2252,7 @@ void initializeDisplay() {
   backlightOn();
 
   vspi.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
-  tft.initR(TFT_INIT_PROFILE);
+  tft.initR(INITR_MINI160x80);
   tft.setSPISpeed(40000000);
   tft.invertDisplay(false);
   tft.enableDisplay(true);
@@ -3144,12 +2261,10 @@ void initializeDisplay() {
 }
 
 void setup() {
-#if ENABLE_SERIAL_DEBUG
   Serial.begin(115200);
   delay(100);
   Serial.println();
   Serial.println("PixieCam iniciando...");
-#endif
 
   psramAvailable = psramFound();
   Serial.printf("PSRAM: %s\n", psramAvailable ? "disponivel" : "indisponivel");
@@ -3166,29 +2281,13 @@ void setup() {
 
   preferences.begin("pixiecam", false);
   flashEnabled = preferences.getBool("flash", false);
-  loadButtonCalibration();
   Serial.printf("Preferencia flash: %s\n", flashEnabled ? "ON" : "OFF");
 
   initializeDisplay();
   drawBootAnimation();
   bootFinished = true;
 
-  if (!buttonCalibrationValid) {
-    runButtonCalibration();
-  }
-
   initializeSDCard();
-
-  bool previousCameraBootInterrupted = cameraBootGuard == CAMERA_BOOT_GUARD_MAGIC;
-  safeCameraBoot = preferences.getBool("cam_safe", false) || previousCameraBootInterrupted;
-  if (previousCameraBootInterrupted) {
-    preferences.putBool("cam_safe", true);
-  }
-  cameraBootGuard = CAMERA_BOOT_GUARD_MAGIC;
-
-  if (safeCameraBoot) {
-    Serial.println("Boot anterior interrompido durante a camera; usando perfil seguro.");
-  }
 
   if (!initializeCamera(CAMERA_PREVIEW_JPEG)) {
     showCenteredMessage("Falha camera", "ver Serial", COLOR_BAD);
