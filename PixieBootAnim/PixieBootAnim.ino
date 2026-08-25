@@ -15,11 +15,12 @@
 
 // --- Projeto ---
 #define PROJECT_NAME        "PixieCam"
-#define PROJECT_VERSION     "1.1.0"
+#define PROJECT_VERSION     "1.2.0"
 #define PROJECT_DEVELOPER   "Desenvolvedor: edite este texto"
 #define DCIM_DIR            "/DCIM"
 #define PHOTO_PREFIX        "PHOTO_"
 #define PHOTO_EXTENSION     ".jpg"
+#define FIRMWARE_BUILD_ID    __DATE__ " " __TIME__
 
 // --- Pinos do display ST7735 0.96 80x160 ---
 #define TFT_CS   13
@@ -83,6 +84,7 @@
 #define CAMERA_CAPTURE_JPEG_QUALITY 2
 #define CAMERA_PREVIEW_JPEG_QUALITY 12
 #define CAMERA_PREVIEW_FRAME_SIZE FRAMESIZE_QVGA
+#define CAMERA_PREVIEW_FILL_SCREEN 1
 #define CAPTURE_SENSOR_SETTLE_MS 900
 #define PREVIEW_SENSOR_SETTLE_MS 35
 #define CAPTURE_WARMUP_FRAMES 2
@@ -616,6 +618,7 @@ void runButtonCalibration() {
   preferences.putUShort("btn_down", buttonAdcDown);
   preferences.putUShort("btn_ok", buttonAdcOk);
   preferences.putUChar("btn_ver", BUTTON_CALIBRATION_VERSION);
+  preferences.putString("btn_build", FIRMWARE_BUILD_ID);
   buttonCalibrationReady = true;
   resetButtonEventState();
 
@@ -627,13 +630,17 @@ void runButtonCalibration() {
 
 void loadOrCalibrateButtons() {
   uint8_t savedVersion = preferences.getUChar("btn_ver", 0);
+  String savedBuildId = preferences.getString("btn_build", "");
   buttonAdcIdle = preferences.getUShort("btn_idle", 4095);
   buttonAdcUp = preferences.getUShort("btn_up", 2000);
   buttonAdcDown = preferences.getUShort("btn_down", 500);
   buttonAdcOk = preferences.getUShort("btn_ok", 0);
 
-  buttonCalibrationReady = savedVersion == BUTTON_CALIBRATION_VERSION && buttonCalibrationIsValid();
+  bool sameFirmwareBuild = savedBuildId == FIRMWARE_BUILD_ID;
+  buttonCalibrationReady = savedVersion == BUTTON_CALIBRATION_VERSION &&
+                           sameFirmwareBuild && buttonCalibrationIsValid();
   if (!buttonCalibrationReady) {
+    Serial.printf("Nova compilacao detectada (%s); calibrando botoes.\n", FIRMWARE_BUILD_ID);
     runButtonCalibration();
     return;
   }
@@ -1360,8 +1367,8 @@ bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitma
 }
 
 bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
-                              int16_t areaX, int16_t areaY, int16_t areaW, int16_t areaH,
-                              bool clearArea) {
+                               int16_t areaX, int16_t areaY, int16_t areaW, int16_t areaH,
+                               bool fillViewport, bool clearArea) {
   if (!jpegBuffer || fileSize == 0) return false;
 
   uint16_t jpgW = 0;
@@ -1373,18 +1380,35 @@ bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
   }
 
   uint8_t scale = 1;
+  if (fillViewport) {
+    // TJpg_Decoder aceita apenas escalas 1, 2, 4 e 8. Escolhe a maior
+    // reducao que ainda cobre toda a area; o excedente e recortado no centro.
+    while (scale < 8) {
+      uint8_t nextScale = scale * 2;
 #if CAMERA_ROTATE_90_CW
-  while ((jpgH / scale > areaW || jpgW / scale > areaH) && scale < 8) {
-    scale *= 2;
-  }
+      int16_t nextDrawW = jpgH / nextScale;
+      int16_t nextDrawH = jpgW / nextScale;
 #else
-  while ((jpgW / scale > areaW || jpgH / scale > areaH * 2) && scale < 8) {
-    scale *= 2;
-  }
-  while (jpgW / scale > areaW && scale < 8) {
-    scale *= 2;
-  }
+      int16_t nextDrawW = jpgW / nextScale;
+      int16_t nextDrawH = jpgH / nextScale;
 #endif
+      if (nextDrawW < areaW || nextDrawH < areaH) break;
+      scale = nextScale;
+    }
+  } else {
+#if CAMERA_ROTATE_90_CW
+    while ((jpgH / scale > areaW || jpgW / scale > areaH) && scale < 8) {
+      scale *= 2;
+    }
+#else
+    while ((jpgW / scale > areaW || jpgH / scale > areaH * 2) && scale < 8) {
+      scale *= 2;
+    }
+    while (jpgW / scale > areaW && scale < 8) {
+      scale *= 2;
+    }
+#endif
+  }
 
   jpegDecodedW = jpgW / scale;
   jpegDecodedH = jpgH / scale;
@@ -1555,7 +1579,8 @@ void showPhoto(int index) {
   }
 
   tft.fillScreen(COLOR_BG);
-  bool drawResult = drawJpegBufferToViewport(jpegBuffer, fileSize, 0, 0, SCREEN_W, SCREEN_H, false);
+  bool drawResult = drawJpegBufferToViewport(jpegBuffer, fileSize, 0, 0, SCREEN_W, SCREEN_H,
+                                             false, false);
   heap_caps_free(jpegBuffer);
 
   if (!drawResult) {
@@ -1862,7 +1887,8 @@ void updateCameraPreview() {
   }
 
   if (fb->format == PIXFORMAT_JPEG && fb->len > 0) {
-    drawJpegBufferToViewport(fb->buf, fb->len, 0, 0, SCREEN_W, SCREEN_H, false);
+    drawJpegBufferToViewport(fb->buf, fb->len, 0, 0, SCREEN_W, SCREEN_H,
+                             CAMERA_PREVIEW_FILL_SCREEN != 0, false);
   } else {
     mostrarFrame(fb);
   }
@@ -2546,8 +2572,8 @@ void setup() {
   drawBootAnimation();
   bootFinished = true;
 
-  // No primeiro uso desta versao, identifica e salva os valores ADC reais de
-  // PARA CIMA, PARA BAIXO e OK/FOTO. Nos proximos boots apenas carrega o mapa.
+  // Cada nova compilacao identifica e salva os valores ADC reais de PARA CIMA,
+  // PARA BAIXO e OK/FOTO. Reinicios do mesmo build reutilizam o mapa salvo.
   loadOrCalibrateButtons();
 
   initializeSDCard();

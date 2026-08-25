@@ -151,8 +151,9 @@ Fluxo de inicializacao
 1. Inicializa Serial, flash, backlight, display e preferencias.
 2. Exibe a animacao existente de boot exatamente a partir de boot_animation.h.
 3. Verifica PSRAM.
-4. No primeiro uso, solicita e salva o mapeamento de PARA CIMA, PARA BAIXO e
-   OK/FOTO. Nos boots seguintes carrega o mapeamento salvo.
+4. No primeiro boot de cada nova compilacao, solicita e salva o mapeamento de
+   PARA CIMA, PARA BAIXO e OK/FOTO. Reinicios do mesmo firmware carregam o
+   mapeamento salvo.
 5. Nao monta o SD no boot por padrao, para evitar travamento em pinos
    compartilhados.
 6. Inicializa a camera em JPEG reservando buffer para foto grande e usa QVGA
@@ -179,20 +180,22 @@ O sketch usa enum AppState:
 Controles
 ---------
 
-Os botoes sao lidos pelo GPIO2. No primeiro boot desta versao, a tela pede:
+Os botoes sao lidos pelo GPIO2. No primeiro boot de cada nova compilacao, a
+tela pede:
 
 1. Pressione PARA CIMA.
 2. Pressione PARA BAIXO.
 3. Pressione OK/FOTO.
 
 O firmware mede o valor ADC real de cada botao, valida que os tres valores sao
-distintos e salva o mapeamento em Preferences/NVS. A calibracao nao se repete
-nos boots seguintes. Se dois valores forem iguais ou muito proximos, o processo
+distintos e salva o mapeamento em Preferences/NVS junto com FIRMWARE_BUILD_ID,
+gerado automaticamente por __DATE__ e __TIME__. Assim, compilar e gravar um
+codigo novo solicita a calibracao uma vez; apenas reiniciar o mesmo build nao
+repete o processo. Se dois valores forem iguais ou muito proximos, o processo
 e reiniciado automaticamente.
 
-Para forcar um novo mapeamento, aumente BUTTON_CALIBRATION_VERSION no inicio do
-sketch (por exemplo, de 1 para 2) e grave o firmware novamente, ou apague a NVS
-da placa.
+BUTTON_CALIBRATION_VERSION continua disponivel para invalidar manualmente a
+calibracao quando o algoritmo de leitura dos botoes for alterado.
 
 Comportamento:
 
@@ -252,9 +255,9 @@ Captura e armazenamento
 
 A camera usa dois perfis no mesmo modo JPEG:
 
-- Preview: JPEG QVGA 320x240, qualidade intermediaria, reduzido para o display
-  160x80. Usa qualidade JPEG 12 para melhorar cores/detalhe sem pesar tanto no
-  desenho do TFT.
+- Preview: JPEG QVGA 320x240, qualidade intermediaria, redimensionado no modo
+  preencher para cobrir os 160x80 pixels do display. O excedente e recortado
+  de forma centralizada, sem margens pretas. Usa qualidade JPEG 12.
 - Captura: JPEG em alta resolucao e baixa compressao somente no momento de
   salvar no SD. Usa qualidade JPEG 2, priorizando a foto aberta no computador.
 - Rotacao: o preview e a galeria giram os pixels 90 graus no sentido horario;
@@ -334,8 +337,9 @@ buffer temporario em PSRAM, quando disponivel, ou heap interna. O SD e entao
 desmontado e a imagem e desenhada no TFT com TJpg_Decoder. Isso evita usar o
 SD e o display ao mesmo tempo nos mesmos pinos.
 
-O redimensionamento usa escala 1, 2, 4 ou 8 da biblioteca TJpg_Decoder,
-preservando proporcao e centralizando a imagem.
+O redimensionamento usa escala 1, 2, 4 ou 8 da biblioteca TJpg_Decoder. A
+galeria preserva a imagem inteira e a centraliza; o preview usa modo preencher,
+preserva a proporcao e recorta o excedente no centro para eliminar margens.
 
 Desligamento e deep sleep
 -------------------------
@@ -396,5 +400,6 @@ arduino-cli compile --fqbn esp32:esp32:esp32cam PixieBootAnim
 
 Resultado:
 
-- Sketch: 554815 bytes de flash.
+- ESP32 Arduino core: 3.3.11.
+- Sketch: 555967 bytes de flash.
 - Variaveis globais: 50840 bytes de RAM.
