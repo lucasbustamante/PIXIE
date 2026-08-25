@@ -15,7 +15,7 @@
 
 // --- Projeto ---
 #define PROJECT_NAME        "PixieCam"
-#define PROJECT_VERSION     "1.0.0"
+#define PROJECT_VERSION     "1.1.0"
 #define PROJECT_DEVELOPER   "Desenvolvedor: edite este texto"
 #define DCIM_DIR            "/DCIM"
 #define PHOTO_PREFIX        "PHOTO_"
@@ -63,6 +63,10 @@
 #define CHECK_SD_ON_BOOT 0
 
 #define TFT_APP_ROTATION 3
+#define CAMERA_ROTATE_90_CW 1
+#define BUTTON_CALIBRATION_VERSION 1
+#define BUTTON_CALIBRATION_MIN_DELTA 80
+#define BUTTON_CALIBRATION_SAMPLES 24
 #define SCREEN_W 160
 #define SCREEN_H 80
 #define MAX_PHOTOS 120
@@ -161,6 +165,12 @@ bool psramAvailable = false;
 bool uiDirty = true;
 bool bootFinished = false;
 bool buttonStuckWarning = false;
+bool buttonCalibrationReady = false;
+
+uint16_t buttonAdcIdle = 4095;
+uint16_t buttonAdcUp = 2000;
+uint16_t buttonAdcDown = 500;
+uint16_t buttonAdcOk = 0;
 
 uint16_t nextPhotoNumber = 1;
 PhotoEntry photos[MAX_PHOTOS];
@@ -191,6 +201,10 @@ int16_t jpegViewportX = 0;
 int16_t jpegViewportY = 0;
 int16_t jpegViewportW = SCREEN_W;
 int16_t jpegViewportH = SCREEN_H;
+int16_t jpegDrawX = 0;
+int16_t jpegDrawY = 0;
+int16_t jpegDecodedW = 0;
+int16_t jpegDecodedH = 0;
 bool captureProfileCached = false;
 framesize_t cachedCaptureFrameSize = FRAMESIZE_SVGA;
 bool cachedCaptureUsesPsram = false;
@@ -230,6 +244,7 @@ bool captureAndSavePhoto();
 void loadPhotoList();
 void showPhoto(int index);
 void enterDeepSleep();
+void loadOrCalibrateButtons();
 
 uint16_t swapRB(uint16_t color) {
   uint8_t r = (color >> 11) & 0x1F;
@@ -445,14 +460,187 @@ void mostrarContadorPower(const char *acao, int segundos) {
   centerText(numberText, 42, COLOR_WARN, 3);
 }
 
+uint16_t adcDistance(uint16_t a, uint16_t b) {
+  return a > b ? a - b : b - a;
+}
+
+uint16_t readButtonAdcAverage(uint8_t samples = 6) {
+  uint32_t total = 0;
+  if (samples == 0) samples = 1;
+
+  for (uint8_t i = 0; i < samples; i++) {
+    total += analogRead(BUTTON_ADC_PIN);
+    delay(2);
+  }
+
+  return (uint16_t)(total / samples);
+}
+
+bool buttonCalibrationIsValid() {
+  if (buttonAdcIdle > 4095 || buttonAdcUp > 4095 ||
+      buttonAdcDown > 4095 || buttonAdcOk > 4095) {
+    return false;
+  }
+
+  if (adcDistance(buttonAdcIdle, buttonAdcUp) < BUTTON_CALIBRATION_MIN_DELTA ||
+      adcDistance(buttonAdcIdle, buttonAdcDown) < BUTTON_CALIBRATION_MIN_DELTA ||
+      adcDistance(buttonAdcIdle, buttonAdcOk) < BUTTON_CALIBRATION_MIN_DELTA) {
+    return false;
+  }
+
+  if (adcDistance(buttonAdcUp, buttonAdcDown) < BUTTON_CALIBRATION_MIN_DELTA ||
+      adcDistance(buttonAdcUp, buttonAdcOk) < BUTTON_CALIBRATION_MIN_DELTA ||
+      adcDistance(buttonAdcDown, buttonAdcOk) < BUTTON_CALIBRATION_MIN_DELTA) {
+    return false;
+  }
+
+  return true;
+}
+
+uint16_t buttonTolerance(uint16_t center, uint16_t otherA, uint16_t otherB) {
+  uint16_t nearest = adcDistance(center, buttonAdcIdle);
+  uint16_t distanceA = adcDistance(center, otherA);
+  uint16_t distanceB = adcDistance(center, otherB);
+  if (distanceA < nearest) nearest = distanceA;
+  if (distanceB < nearest) nearest = distanceB;
+
+  uint16_t tolerance = (nearest * 45U) / 100U;
+  if (tolerance < 35) tolerance = 35;
+  if (tolerance > 600) tolerance = 600;
+  return tolerance;
+}
+
 ButtonType lerBotao() {
-  int valor = analogRead(BUTTON_ADC_PIN);
+  uint16_t value = analogRead(BUTTON_ADC_PIN);
 
-  if (valor < 100) return BTN_FOTO;
-  if (valor > 200 && valor < 900) return BTN_DOWN;
-  if (valor > 900 && valor < 3900) return BTN_UP;
+  if (!buttonCalibrationReady) {
+    if (value < 100) return BTN_FOTO;
+    if (value > 200 && value < 900) return BTN_DOWN;
+    if (value > 900 && value < 3900) return BTN_UP;
+    return BTN_NONE;
+  }
 
-  return BTN_NONE;
+  uint16_t upDistance = adcDistance(value, buttonAdcUp);
+  uint16_t downDistance = adcDistance(value, buttonAdcDown);
+  uint16_t okDistance = adcDistance(value, buttonAdcOk);
+
+  ButtonType closestButton = BTN_UP;
+  uint16_t closestDistance = upDistance;
+  uint16_t acceptedTolerance = buttonTolerance(buttonAdcUp, buttonAdcDown, buttonAdcOk);
+
+  if (downDistance < closestDistance) {
+    closestButton = BTN_DOWN;
+    closestDistance = downDistance;
+    acceptedTolerance = buttonTolerance(buttonAdcDown, buttonAdcUp, buttonAdcOk);
+  }
+
+  if (okDistance < closestDistance) {
+    closestButton = BTN_FOTO;
+    closestDistance = okDistance;
+    acceptedTolerance = buttonTolerance(buttonAdcOk, buttonAdcUp, buttonAdcDown);
+  }
+
+  return closestDistance <= acceptedTolerance ? closestButton : BTN_NONE;
+}
+
+uint16_t captureButtonForCalibration(const char *buttonName) {
+  tft.fillScreen(COLOR_BG);
+  drawHeader("Mapear botoes");
+  centerText("Pressione", 28, COLOR_TEXT, 1);
+  centerText(buttonName, 46, COLOR_ACCENT, 2);
+
+  uint16_t candidate = buttonAdcIdle;
+  while (true) {
+    candidate = readButtonAdcAverage(4);
+    if (adcDistance(candidate, buttonAdcIdle) >= BUTTON_CALIBRATION_MIN_DELTA) {
+      delay(90);
+      uint16_t confirmed = readButtonAdcAverage(BUTTON_CALIBRATION_SAMPLES);
+      if (adcDistance(confirmed, buttonAdcIdle) >= BUTTON_CALIBRATION_MIN_DELTA) {
+        candidate = confirmed;
+        break;
+      }
+    }
+    delay(8);
+  }
+
+  char adcText[22];
+  snprintf(adcText, sizeof(adcText), "ADC: %u", candidate);
+  tft.fillScreen(COLOR_BG);
+  drawHeader("Mapear botoes");
+  centerText("Mapeado", 26, COLOR_OK, 1);
+  centerText(adcText, 42, COLOR_TEXT, 1);
+  centerText("Solte o botao", 60, COLOR_MUTED, 1);
+
+  while (adcDistance(readButtonAdcAverage(4), buttonAdcIdle) >= BUTTON_CALIBRATION_MIN_DELTA / 2) {
+    delay(10);
+  }
+  delay(180);
+  return candidate;
+}
+
+void resetButtonEventState() {
+  stableButton = BTN_NONE;
+  lastRawButton = BTN_NONE;
+  lastButtonChangeMs = millis();
+  buttonPressStartMs = 0;
+  lastRepeatMs = 0;
+  longEventSent = false;
+  powerEventSent = false;
+  buttonStuckWarning = false;
+}
+
+void runButtonCalibration() {
+  buttonCalibrationReady = false;
+
+  while (true) {
+    tft.fillScreen(COLOR_BG);
+    drawHeader("Primeiro uso");
+    centerText("Solte os botoes", 28, COLOR_TEXT, 1);
+    centerText("Calibrando...", 48, COLOR_MUTED, 1);
+    delay(1500);
+    buttonAdcIdle = readButtonAdcAverage(BUTTON_CALIBRATION_SAMPLES);
+
+    buttonAdcUp = captureButtonForCalibration("PARA CIMA");
+    buttonAdcDown = captureButtonForCalibration("PARA BAIXO");
+    buttonAdcOk = captureButtonForCalibration("OK / FOTO");
+
+    if (buttonCalibrationIsValid()) break;
+
+    Serial.println("Mapeamento invalido: valores ADC repetidos ou muito proximos.");
+    showCenteredMessage("Mapeamento invalido", "Tente novamente", COLOR_BAD);
+    delay(1400);
+  }
+
+  preferences.putUShort("btn_idle", buttonAdcIdle);
+  preferences.putUShort("btn_up", buttonAdcUp);
+  preferences.putUShort("btn_down", buttonAdcDown);
+  preferences.putUShort("btn_ok", buttonAdcOk);
+  preferences.putUChar("btn_ver", BUTTON_CALIBRATION_VERSION);
+  buttonCalibrationReady = true;
+  resetButtonEventState();
+
+  Serial.printf("Botoes mapeados: idle=%u up=%u down=%u ok=%u\n",
+                buttonAdcIdle, buttonAdcUp, buttonAdcDown, buttonAdcOk);
+  showCenteredMessage("Botoes mapeados", "Configuracao salva", COLOR_OK);
+  delay(1000);
+}
+
+void loadOrCalibrateButtons() {
+  uint8_t savedVersion = preferences.getUChar("btn_ver", 0);
+  buttonAdcIdle = preferences.getUShort("btn_idle", 4095);
+  buttonAdcUp = preferences.getUShort("btn_up", 2000);
+  buttonAdcDown = preferences.getUShort("btn_down", 500);
+  buttonAdcOk = preferences.getUShort("btn_ok", 0);
+
+  buttonCalibrationReady = savedVersion == BUTTON_CALIBRATION_VERSION && buttonCalibrationIsValid();
+  if (!buttonCalibrationReady) {
+    runButtonCalibration();
+    return;
+  }
+
+  resetButtonEventState();
+  Serial.printf("Mapeamento carregado: idle=%u up=%u down=%u ok=%u\n",
+                buttonAdcIdle, buttonAdcUp, buttonAdcDown, buttonAdcOk);
 }
 
 ButtonEvent readButtonEvent() {
@@ -1114,6 +1302,37 @@ void *allocImageBuffer(size_t size) {
 }
 
 bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
+#if CAMERA_ROTATE_90_CW
+  int16_t viewXEnd = jpegViewportX + jpegViewportW;
+  int16_t viewYEnd = jpegViewportY + jpegViewportH;
+
+  // Cada linha horizontal decodificada vira uma coluna vertical. A formula
+  // (x, y) -> (altura - 1 - y, x) corresponde a 90 graus no sentido horario.
+  for (uint16_t row = 0; row < h; row++) {
+    int16_t sourceY = y + row;
+    int16_t destinationX = jpegDrawX + jpegDecodedH - 1 - sourceY;
+    int16_t destinationY = jpegDrawY + x;
+    int16_t firstPixel = 0;
+    int16_t pixelCount = w;
+
+    if (destinationX < jpegViewportX || destinationX >= viewXEnd) continue;
+
+    if (destinationY < jpegViewportY) {
+      firstPixel = jpegViewportY - destinationY;
+      pixelCount -= firstPixel;
+      destinationY = jpegViewportY;
+    }
+    if (destinationY + pixelCount > viewYEnd) {
+      pixelCount = viewYEnd - destinationY;
+    }
+    if (pixelCount <= 0) continue;
+
+    uint16_t *src = bitmap + row * w + firstPixel;
+    tft.drawRGBBitmap(destinationX, destinationY, src, 1, pixelCount);
+  }
+
+  return true;
+#else
   int16_t clipX0 = x > jpegViewportX ? x : jpegViewportX;
   int16_t clipY0 = y > jpegViewportY ? y : jpegViewportY;
   int16_t xEnd = x + (int16_t)w;
@@ -1137,6 +1356,7 @@ bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitma
   }
 
   return true;
+#endif
 }
 
 bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
@@ -1153,17 +1373,30 @@ bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
   }
 
   uint8_t scale = 1;
+#if CAMERA_ROTATE_90_CW
+  while ((jpgH / scale > areaW || jpgW / scale > areaH) && scale < 8) {
+    scale *= 2;
+  }
+#else
   while ((jpgW / scale > areaW || jpgH / scale > areaH * 2) && scale < 8) {
     scale *= 2;
   }
   while (jpgW / scale > areaW && scale < 8) {
     scale *= 2;
   }
+#endif
 
-  int16_t drawW = jpgW / scale;
-  int16_t drawH = jpgH / scale;
-  int16_t drawX = areaX + (areaW - drawW) / 2;
-  int16_t drawY = areaY + (areaH - drawH) / 2;
+  jpegDecodedW = jpgW / scale;
+  jpegDecodedH = jpgH / scale;
+#if CAMERA_ROTATE_90_CW
+  int16_t drawW = jpegDecodedH;
+  int16_t drawH = jpegDecodedW;
+#else
+  int16_t drawW = jpegDecodedW;
+  int16_t drawH = jpegDecodedH;
+#endif
+  jpegDrawX = areaX + (areaW - drawW) / 2;
+  jpegDrawY = areaY + (areaH - drawH) / 2;
 
   jpegViewportX = areaX;
   jpegViewportY = areaY;
@@ -1178,7 +1411,11 @@ bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
   TJpgDec.setSwapBytes(false);
   TJpgDec.setCallback(tftJpegOutput);
 
-  JRESULT drawResult = TJpgDec.drawJpg(drawX, drawY, jpegBuffer, fileSize);
+#if CAMERA_ROTATE_90_CW
+  JRESULT drawResult = TJpgDec.drawJpg(0, 0, jpegBuffer, fileSize);
+#else
+  JRESULT drawResult = TJpgDec.drawJpg(jpegDrawX, jpegDrawY, jpegBuffer, fileSize);
+#endif
   if (drawResult != JDR_OK) {
     Serial.printf("Falha ao desenhar JPEG: %d\n", drawResult);
     return false;
@@ -1683,7 +1920,19 @@ bool writeBuffered(fs::File &file, const uint8_t *data, size_t len, size_t *tota
 }
 
 bool writeJpegToSD(const char *photoPath, const uint8_t *jpegData, size_t jpegLen, size_t *savedBytes) {
-  if (!jpegData || jpegLen == 0) return false;
+  if (!jpegData || jpegLen < 2 || jpegData[0] != 0xFF || jpegData[1] != 0xD8) return false;
+
+  // EXIF Orientation=6 informa aos visualizadores que a foto deve ser exibida
+  // 90 graus no sentido horario, sem recomprimir nem reduzir a qualidade JPEG.
+  static const uint8_t exifRotate90Clockwise[] = {
+    0xFF, 0xE1, 0x00, 0x22,
+    'E', 'x', 'i', 'f', 0x00, 0x00,
+    'I', 'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00,
+    0x01, 0x00,
+    0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x06, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00
+  };
 
   fs::File photoFile = SD_MMC.open(photoPath, FILE_WRITE, true);
   if (!photoFile) {
@@ -1691,8 +1940,18 @@ bool writeJpegToSD(const char *photoPath, const uint8_t *jpegData, size_t jpegLe
     return false;
   }
 
+  size_t expectedSize = jpegLen;
   size_t writtenTotal = 0;
-  bool ok = writeBuffered(photoFile, jpegData, jpegLen, &writtenTotal);
+  bool ok = true;
+
+#if CAMERA_ROTATE_90_CW
+  expectedSize += sizeof(exifRotate90Clockwise);
+  ok = writeBuffered(photoFile, jpegData, 2, &writtenTotal) &&
+       writeBuffered(photoFile, exifRotate90Clockwise, sizeof(exifRotate90Clockwise), &writtenTotal) &&
+       writeBuffered(photoFile, jpegData + 2, jpegLen - 2, &writtenTotal);
+#else
+  ok = writeBuffered(photoFile, jpegData, jpegLen, &writtenTotal);
+#endif
   photoFile.flush();
   photoFile.close();
 
@@ -1703,9 +1962,9 @@ bool writeJpegToSD(const char *photoPath, const uint8_t *jpegData, size_t jpegLe
   if (verifyFile) verifyFile.close();
 
   Serial.printf("Verificacao JPEG %s: escrito=%u salvo=%u esperado=%u\n",
-                photoPath, (unsigned)writtenTotal, (unsigned)verifySize, (unsigned)jpegLen);
+                photoPath, (unsigned)writtenTotal, (unsigned)verifySize, (unsigned)expectedSize);
 
-  if (!ok || writtenTotal != jpegLen || verifySize != jpegLen) {
+  if (!ok || writtenTotal != expectedSize || verifySize != expectedSize) {
     SD_MMC.remove(photoPath);
     return false;
   }
@@ -2286,6 +2545,10 @@ void setup() {
   initializeDisplay();
   drawBootAnimation();
   bootFinished = true;
+
+  // No primeiro uso desta versao, identifica e salva os valores ADC reais de
+  // PARA CIMA, PARA BAIXO e OK/FOTO. Nos proximos boots apenas carrega o mapa.
+  loadOrCalibrateButtons();
 
   initializeSDCard();
 

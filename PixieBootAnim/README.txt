@@ -135,17 +135,29 @@ Se no seu hardware a tela ficar de cabeca para baixo, altere somente:
 
 O restante da interface ja foi redesenhado para 160x80.
 
+Orientacao da camera
+--------------------
+
+A imagem da camera e girada 90 graus no sentido horario no preview e na
+galeria. As fotos JPEG salvas recebem a orientacao EXIF 6, de modo que celulares
+e computadores compativeis tambem as abrem giradas corretamente, sem
+recompressao nem perda de qualidade. A opcao fica em:
+
+- CAMERA_ROTATE_90_CW 1
+
 Fluxo de inicializacao
 ----------------------
 
 1. Inicializa Serial, flash, backlight, display e preferencias.
 2. Exibe a animacao existente de boot exatamente a partir de boot_animation.h.
 3. Verifica PSRAM.
-4. Nao monta o SD no boot por padrao, para evitar travamento em pinos
+4. No primeiro uso, solicita e salva o mapeamento de PARA CIMA, PARA BAIXO e
+   OK/FOTO. Nos boots seguintes carrega o mapeamento salvo.
+5. Nao monta o SD no boot por padrao, para evitar travamento em pinos
    compartilhados.
-5. Inicializa a camera em JPEG reservando buffer para foto grande e usa QQVGA
+6. Inicializa a camera em JPEG reservando buffer para foto grande e usa QVGA
    apenas para o preview do display.
-6. Entra na tela Camera com visualizacao em tempo real.
+7. Entra na tela Camera com visualizacao em tempo real.
 
 Estados da interface
 --------------------
@@ -167,11 +179,20 @@ O sketch usa enum AppState:
 Controles
 ---------
 
-Os botoes sao lidos pelo GPIO2 usando os limiares existentes:
+Os botoes sao lidos pelo GPIO2. No primeiro boot desta versao, a tela pede:
 
-- valor < 100: OK/FOTO
-- 200 a 900: DOWN
-- 900 a 3900: UP
+1. Pressione PARA CIMA.
+2. Pressione PARA BAIXO.
+3. Pressione OK/FOTO.
+
+O firmware mede o valor ADC real de cada botao, valida que os tres valores sao
+distintos e salva o mapeamento em Preferences/NVS. A calibracao nao se repete
+nos boots seguintes. Se dois valores forem iguais ou muito proximos, o processo
+e reiniciado automaticamente.
+
+Para forcar um novo mapeamento, aumente BUTTON_CALIBRATION_VERSION no inicio do
+sketch (por exemplo, de 1 para 2) e grave o firmware novamente, ou apague a NVS
+da placa.
 
 Comportamento:
 
@@ -236,6 +257,8 @@ A camera usa dois perfis no mesmo modo JPEG:
   desenho do TFT.
 - Captura: JPEG em alta resolucao e baixa compressao somente no momento de
   salvar no SD. Usa qualidade JPEG 2, priorizando a foto aberta no computador.
+- Rotacao: o preview e a galeria giram os pixels 90 graus no sentido horario;
+  o JPEG salvo recebe EXIF Orientation=6 para manter a resolucao e a qualidade.
 
 Assim o display usa uma qualidade menor que a foto salva, mas melhor que o
 preview antigo, enquanto o arquivo no SD prioriza a melhor qualidade possivel
@@ -344,10 +367,11 @@ o deep sleep.
 Possiveis ajustes de display
 ----------------------------
 
-Se a imagem estiver invertida, ajuste:
+Se a orientacao fisica da camera mudar, ajuste:
 
-- tft.setRotation(2)
-- sensor vflip/hmirror em applySensorDefaults()
+- CAMERA_ROTATE_90_CW (1 ativa a rotacao de 90 graus no sentido horario)
+- sensor vflip/hmirror em applySensorDefaults() para espelhamento ou giro de
+  180 graus
 
 Se as cores da galeria aparecerem trocadas, altere:
 
@@ -372,5 +396,5 @@ arduino-cli compile --fqbn esp32:esp32:esp32cam PixieBootAnim
 
 Resultado:
 
-- Sketch: 569431 bytes de flash.
-- Variaveis globais: 50784 bytes de RAM.
+- Sketch: 554815 bytes de flash.
+- Variaveis globais: 50840 bytes de RAM.
