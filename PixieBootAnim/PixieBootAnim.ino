@@ -67,8 +67,14 @@
 // Rotacao usada SOMENTE no live da camera: 90 graus para a esquerda
 // em relacao a orientacao normal do aplicativo (3 -> 2).
 #define TFT_CAMERA_ROTATION 2
-// Mantido como no codigo original: usado no JPEG/foto/galeria.
+// Mantido como no codigo original: usado apenas para a orientacao gravada
+// no JPEG salvo no SD. A galeria agora possui sua propria rotacao.
 #define CAMERA_ROTATE_90_CW 1
+// Galeria: gira SOMENTE a imagem exibida 90 graus para a esquerda.
+#define GALLERY_ROTATE_90_LEFT 1
+// Corrige troca entre vermelho e azul na imagem JPEG exibida na galeria.
+// Se o seu modulo especifico ja entregar RGB correto, basta trocar para 0.
+#define GALLERY_SWAP_RED_BLUE 1
 #define BUTTON_CALIBRATION_VERSION 1
 #define BUTTON_CALIBRATION_MIN_DELTA 80
 #define BUTTON_CALIBRATION_SAMPLES 24
@@ -255,6 +261,14 @@ uint16_t swapRB(uint16_t color) {
   uint8_t g = (color >> 5) & 0x3F;
   uint8_t b = color & 0x1F;
   return (b << 11) | (g << 5) | r;
+}
+
+uint16_t galleryFixColor(uint16_t color) {
+#if GALLERY_SWAP_RED_BLUE
+  return swapRB(color);
+#else
+  return color;
+#endif
 }
 
 void copyText(char *dst, const char *src, size_t dstSize) {
@@ -1349,33 +1363,46 @@ void *allocImageBuffer(size_t size) {
 }
 
 bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
-#if CAMERA_ROTATE_90_CW
+#if GALLERY_ROTATE_90_LEFT
   int16_t viewXEnd = jpegViewportX + jpegViewportW;
   int16_t viewYEnd = jpegViewportY + jpegViewportH;
 
-  // Cada linha horizontal decodificada vira uma coluna vertical. A formula
-  // (x, y) -> (altura - 1 - y, x) corresponde a 90 graus no sentido horario.
+  // Rotacao EXCLUSIVA da galeria: 90 graus para a esquerda (anti-horario).
+  // Para cada linha horizontal do JPEG decodificado, desenhamos uma coluna
+  // vertical de baixo para cima. A imagem salva no SD nao e alterada.
   for (uint16_t row = 0; row < h; row++) {
     int16_t sourceY = y + row;
-    int16_t destinationX = jpegDrawX + jpegDecodedH - 1 - sourceY;
-    int16_t destinationY = jpegDrawY + x;
-    int16_t firstPixel = 0;
-    int16_t pixelCount = w;
+    int16_t destinationX = jpegDrawX + sourceY;
 
     if (destinationX < jpegViewportX || destinationX >= viewXEnd) continue;
 
-    if (destinationY < jpegViewportY) {
-      firstPixel = jpegViewportY - destinationY;
-      pixelCount -= firstPixel;
-      destinationY = jpegViewportY;
-    }
-    if (destinationY + pixelCount > viewYEnd) {
-      pixelCount = viewYEnd - destinationY;
-    }
-    if (pixelCount <= 0) continue;
+    int16_t sourceXMin = x;
+    int16_t sourceXMax = x + (int16_t)w - 1;
 
-    uint16_t *src = bitmap + row * w + firstPixel;
-    tft.drawRGBBitmap(destinationX, destinationY, src, 1, pixelCount);
+    int16_t destinationYMin = jpegDrawY + jpegDecodedW - 1 - sourceXMax;
+    int16_t destinationYMax = jpegDrawY + jpegDecodedW - 1 - sourceXMin;
+
+    int16_t clipY0 = destinationYMin > jpegViewportY ? destinationYMin : jpegViewportY;
+    int16_t clipY1 = (destinationYMax + 1) < viewYEnd ? (destinationYMax + 1) : viewYEnd;
+
+    if (clipY0 >= clipY1) continue;
+
+    int16_t pixelCount = clipY1 - clipY0;
+
+    for (int16_t i = 0; i < pixelCount; i++) {
+      int16_t destinationY = clipY0 + i;
+      int16_t sourceX = jpegDecodedW - 1 - (destinationY - jpegDrawY);
+      int16_t sourceCol = sourceX - x;
+
+      if (sourceCol < 0 || sourceCol >= (int16_t)w) {
+        lineBuffer[i] = COLOR_BG;
+      } else {
+        uint16_t color = bitmap[row * w + sourceCol];
+        lineBuffer[i] = galleryFixColor(color);
+      }
+    }
+
+    tft.drawRGBBitmap(destinationX, clipY0, lineBuffer, 1, pixelCount);
   }
 
   return true;
@@ -1396,7 +1423,7 @@ bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitma
     uint16_t drawW = clipX1 - clipX0;
 
     for (uint16_t col = 0; col < drawW; col++) {
-      lineBuffer[col] = src[col];
+      lineBuffer[col] = galleryFixColor(src[col]);
     }
 
     tft.drawRGBBitmap(clipX0, row, lineBuffer, drawW, 1);
@@ -1425,7 +1452,7 @@ bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
     // reducao que ainda cobre toda a area; o excedente e recortado no centro.
     while (scale < 8) {
       uint8_t nextScale = scale * 2;
-#if CAMERA_ROTATE_90_CW
+#if GALLERY_ROTATE_90_LEFT
       int16_t nextDrawW = jpgH / nextScale;
       int16_t nextDrawH = jpgW / nextScale;
 #else
@@ -1436,7 +1463,7 @@ bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
       scale = nextScale;
     }
   } else {
-#if CAMERA_ROTATE_90_CW
+#if GALLERY_ROTATE_90_LEFT
     while ((jpgH / scale > areaW || jpgW / scale > areaH) && scale < 8) {
       scale *= 2;
     }
@@ -1452,7 +1479,7 @@ bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
 
   jpegDecodedW = jpgW / scale;
   jpegDecodedH = jpgH / scale;
-#if CAMERA_ROTATE_90_CW
+#if GALLERY_ROTATE_90_LEFT
   int16_t drawW = jpegDecodedH;
   int16_t drawH = jpegDecodedW;
 #else
@@ -1472,10 +1499,10 @@ bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
   }
 
   TJpgDec.setJpgScale(scale);
-  TJpgDec.setSwapBytes(false);
+  TJpgDec.setSwapBytes(false);  // Adafruit_GFX recebe RGB565 nativo; cor e corrigida no callback.
   TJpgDec.setCallback(tftJpegOutput);
 
-#if CAMERA_ROTATE_90_CW
+#if GALLERY_ROTATE_90_LEFT
   JRESULT drawResult = TJpgDec.drawJpg(0, 0, jpegBuffer, fileSize);
 #else
   JRESULT drawResult = TJpgDec.drawJpg(jpegDrawX, jpegDrawY, jpegBuffer, fileSize);
