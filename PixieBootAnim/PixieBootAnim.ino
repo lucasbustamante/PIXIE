@@ -64,6 +64,10 @@
 #define CHECK_SD_ON_BOOT 0
 
 #define TFT_APP_ROTATION 3
+// Rotacao usada SOMENTE no live da camera: 90 graus para a esquerda
+// em relacao a orientacao normal do aplicativo (3 -> 2).
+#define TFT_CAMERA_ROTATION 2
+// Mantido como no codigo original: usado no JPEG/foto/galeria.
 #define CAMERA_ROTATE_90_CW 1
 #define BUTTON_CALIBRATION_VERSION 1
 #define BUTTON_CALIBRATION_MIN_DELTA 80
@@ -352,7 +356,15 @@ void restoreDisplayBus() {
   digitalWrite(TFT_CS, HIGH);
   vspi.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
   tft.setSPISpeed(40000000);
-  tft.setRotation(TFT_APP_ROTATION);
+
+  // Se o sistema ainda estiver no modo camera, restaura o TFT na orientacao
+  // exclusiva do live. Nos demais estados, volta para a orientacao normal.
+  if (appState == STATE_CAMERA) {
+    tft.setRotation(TFT_CAMERA_ROTATION);
+  } else {
+    tft.setRotation(TFT_APP_ROTATION);
+  }
+
   tft.enableDisplay(true);
   pinMode(BUTTON_ADC_PIN, INPUT);
 }
@@ -397,6 +409,8 @@ void drawBootAnimation() {
 }
 
 void mostrarAnimacaoInicial() {
+  // A animacao original usava rotacao 3. Rotacao 1 corresponde a 180 graus
+  // em relacao a ela, sem alterar os bitmaps de boot_animation.h.
   tft.setRotation(3);
   tft.fillScreen(ST77XX_BLACK);
 
@@ -410,6 +424,7 @@ void mostrarAnimacaoInicial() {
 
   delay(150);
 
+  // Ao terminar o boot, retorna para a orientacao normal do aplicativo.
   tft.setRotation(TFT_APP_ROTATION);
   tft.fillScreen(ST77XX_BLACK);
 }
@@ -1697,17 +1712,10 @@ void drawListMenu(const char *title, const char **items, uint8_t count, uint8_t 
 }
 
 void drawCameraScreen() {
+  // Somente o modo LIVE usa esta orientacao.
+  tft.setRotation(TFT_CAMERA_ROTATION);
   tft.fillScreen(COLOR_BG);
-  tft.drawRoundRect(0, 0, SCREEN_W, SCREEN_H, 3, COLOR_PANEL_2);
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_TEXT, COLOR_BG);
-  tft.setCursor(3, 3);
-  tft.print("Camera");
-  tft.setTextColor(COLOR_MUTED, COLOR_BG);
-  tft.setCursor(92, 3);
-  tft.print("UP/DOWN");
-  tft.setCursor(3, 69);
-  tft.print(flashEnabled ? "Flash ON" : "Flash OFF");
+  lastCameraFrameMs = 0;
 }
 
 void drawMainMenu() {
@@ -1879,22 +1887,60 @@ void showCaptureAnimation() {
 }
 
 void mostrarFrame(camera_fb_t *fb) {
-  if (!fb || fb->format != PIXFORMAT_RGB565 || fb->width < SCREEN_W || fb->height < SCREEN_H) return;
+  if (!fb || fb->format != PIXFORMAT_RGB565) return;
 
-  int cropTop = ((int)fb->height - SCREEN_H) / 2;
-  if (cropTop < 0) cropTop = 0;
+  // Com TFT_CAMERA_ROTATION = 2, o ST7735 passa a trabalhar logicamente
+  // em 80x160. O live e desenhado usando as dimensoes reais retornadas pelo
+  // display, portanto esta rotacao afeta somente a visualizacao em tempo real.
+  const int destW = tft.width();
+  const int destH = tft.height();
+  const int srcW = (int)fb->width;
+  const int srcH = (int)fb->height;
 
-  for (int y = 0; y < SCREEN_H; y++) {
-    // O codigo de referencia percorria as linhas de baixo para cima e por isso
-    // deixava a imagem invertida. Aqui a leitura segue de cima para baixo.
-    int sourceY = y + cropTop;
-    uint16_t *src = (uint16_t *)(fb->buf + sourceY * fb->width * 2);
+  if (destW <= 0 || destH <= 0 || srcW <= 0 || srcH <= 0) return;
+  if (destW > SCREEN_W) return;  // lineBuffer possui SCREEN_W pixels.
 
-    for (int x = 0; x < SCREEN_W; x++) {
-      lineBuffer[x] = swapRB(__builtin_bswap16(src[x]));
+  // Preenche toda a tela sem esticar a imagem: calcula um recorte central
+  // com a mesma proporcao da area logica do TFT e depois redimensiona.
+  int cropX = 0;
+  int cropY = 0;
+  int cropW = srcW;
+  int cropH = srcH;
+
+  const int64_t srcRatioCross = (int64_t)srcW * destH;
+  const int64_t dstRatioCross = (int64_t)destW * srcH;
+
+  if (srcRatioCross > dstRatioCross) {
+    // Fonte mais larga: recorta as laterais.
+    cropW = (int)(((int64_t)srcH * destW) / destH);
+    if (cropW < 1) cropW = 1;
+    if (cropW > srcW) cropW = srcW;
+    cropX = (srcW - cropW) / 2;
+  } else if (srcRatioCross < dstRatioCross) {
+    // Fonte mais alta: recorta topo e base.
+    cropH = (int)(((int64_t)srcW * destH) / destW);
+    if (cropH < 1) cropH = 1;
+    if (cropH > srcH) cropH = srcH;
+    cropY = (srcH - cropH) / 2;
+  }
+
+  uint16_t *srcPixels = (uint16_t *)fb->buf;
+
+  for (int y = 0; y < destH; y++) {
+    int sourceY = cropY + (int)(((int64_t)y * cropH) / destH);
+    if (sourceY >= cropY + cropH) sourceY = cropY + cropH - 1;
+    if (sourceY >= srcH) sourceY = srcH - 1;
+
+    for (int x = 0; x < destW; x++) {
+      int sourceX = cropX + (int)(((int64_t)x * cropW) / destW);
+      if (sourceX >= cropX + cropW) sourceX = cropX + cropW - 1;
+      if (sourceX >= srcW) sourceX = srcW - 1;
+
+      uint16_t pixel = srcPixels[(sourceY * srcW) + sourceX];
+      lineBuffer[x] = swapRB(__builtin_bswap16(pixel));
     }
 
-    tft.drawRGBBitmap(0, y, lineBuffer, SCREEN_W, 1);
+    tft.drawRGBBitmap(0, y, lineBuffer, destW, 1);
   }
 }
 
@@ -2255,6 +2301,14 @@ void setAppState(AppState newState) {
   appState = newState;
   uiDirty = true;
   lastUiFrameMs = 0;
+
+  // A rotacao 90 graus para a esquerda existe SOMENTE enquanto o estado
+  // atual for a camera ao vivo. Todos os outros menus continuam em rotacao 3.
+  if (newState == STATE_CAMERA) {
+    tft.setRotation(TFT_CAMERA_ROTATION);
+  } else {
+    tft.setRotation(TFT_APP_ROTATION);
+  }
 
   switch (newState) {
     case STATE_CAMERA:
