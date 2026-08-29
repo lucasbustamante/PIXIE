@@ -1367,42 +1367,39 @@ bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitma
   int16_t viewXEnd = jpegViewportX + jpegViewportW;
   int16_t viewYEnd = jpegViewportY + jpegViewportH;
 
-  // Rotacao EXCLUSIVA da galeria: 90 graus para a esquerda (anti-horario).
-  // Para cada linha horizontal do JPEG decodificado, desenhamos uma coluna
-  // vertical de baixo para cima. A imagem salva no SD nao e alterada.
+  // Rotacao EXCLUSIVA da galeria: 90 graus para a ESQUERDA no display.
+  // Como o TFT ja trabalha com TFT_APP_ROTATION=3, o mapeamento abaixo e o
+  // sentido oposto ao anterior para que, fisicamente, a foto vire para a esquerda.
+  // A foto salva no SD nao e alterada.
   for (uint16_t row = 0; row < h; row++) {
     int16_t sourceY = y + row;
-    int16_t destinationX = jpegDrawX + sourceY;
+
+    // Uma linha horizontal do JPEG vira uma coluna vertical no TFT.
+    int16_t destinationX = jpegDrawX + jpegDecodedH - 1 - sourceY;
+    int16_t destinationY = jpegDrawY + x;
+    int16_t firstPixel = 0;
+    int16_t pixelCount = w;
 
     if (destinationX < jpegViewportX || destinationX >= viewXEnd) continue;
 
-    int16_t sourceXMin = x;
-    int16_t sourceXMax = x + (int16_t)w - 1;
-
-    int16_t destinationYMin = jpegDrawY + jpegDecodedW - 1 - sourceXMax;
-    int16_t destinationYMax = jpegDrawY + jpegDecodedW - 1 - sourceXMin;
-
-    int16_t clipY0 = destinationYMin > jpegViewportY ? destinationYMin : jpegViewportY;
-    int16_t clipY1 = (destinationYMax + 1) < viewYEnd ? (destinationYMax + 1) : viewYEnd;
-
-    if (clipY0 >= clipY1) continue;
-
-    int16_t pixelCount = clipY1 - clipY0;
-
-    for (int16_t i = 0; i < pixelCount; i++) {
-      int16_t destinationY = clipY0 + i;
-      int16_t sourceX = jpegDecodedW - 1 - (destinationY - jpegDrawY);
-      int16_t sourceCol = sourceX - x;
-
-      if (sourceCol < 0 || sourceCol >= (int16_t)w) {
-        lineBuffer[i] = COLOR_BG;
-      } else {
-        uint16_t color = bitmap[row * w + sourceCol];
-        lineBuffer[i] = galleryFixColor(color);
-      }
+    if (destinationY < jpegViewportY) {
+      firstPixel = jpegViewportY - destinationY;
+      pixelCount -= firstPixel;
+      destinationY = jpegViewportY;
     }
 
-    tft.drawRGBBitmap(destinationX, clipY0, lineBuffer, 1, pixelCount);
+    if (destinationY + pixelCount > viewYEnd) {
+      pixelCount = viewYEnd - destinationY;
+    }
+
+    if (pixelCount <= 0) continue;
+
+    uint16_t *src = bitmap + row * w + firstPixel;
+    for (int16_t i = 0; i < pixelCount; i++) {
+      lineBuffer[i] = galleryFixColor(src[i]);
+    }
+
+    tft.drawRGBBitmap(destinationX, destinationY, lineBuffer, 1, pixelCount);
   }
 
   return true;
@@ -1432,6 +1429,7 @@ bool tftJpegOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitma
   return true;
 #endif
 }
+
 
 bool drawJpegBufferToViewport(const uint8_t *jpegBuffer, size_t fileSize,
                                int16_t areaX, int16_t areaY, int16_t areaW, int16_t areaH,
