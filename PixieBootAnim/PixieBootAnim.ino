@@ -82,9 +82,7 @@
 #define PREVIEW_AREA_H 68
 #define GALLERY_INFO_Y 66
 #define CAMERA_CAPTURE_JPEG_QUALITY 2
-#define CAMERA_PREVIEW_JPEG_QUALITY 12
-#define CAMERA_PREVIEW_FRAME_SIZE FRAMESIZE_QVGA
-#define CAMERA_PREVIEW_FILL_SCREEN 1
+#define CAMERA_PREVIEW_FRAME_SIZE FRAMESIZE_QQVGA
 #define CAPTURE_SENSOR_SETTLE_MS 900
 #define PREVIEW_SENSOR_SETTLE_MS 35
 #define CAPTURE_WARMUP_FRAMES 2
@@ -142,7 +140,7 @@ enum ButtonEventType {
 
 enum CameraMode {
   CAMERA_OFF,
-  CAMERA_PREVIEW_JPEG,
+  CAMERA_PREVIEW_RGB565,
   CAMERA_CAPTURE_JPEG
 };
 
@@ -751,8 +749,8 @@ camera_config_t makeCameraConfig(CameraMode mode, framesize_t frameSize, bool us
   config.fb_count = fbCount;
   config.fb_location = usePsramBuffer ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.grab_mode = fbCount > 1 ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.jpeg_quality = CAMERA_CAPTURE_JPEG_QUALITY;
+  config.pixel_format = mode == CAMERA_PREVIEW_RGB565 ? PIXFORMAT_RGB565 : PIXFORMAT_JPEG;
+  config.jpeg_quality = mode == CAMERA_PREVIEW_RGB565 ? 12 : CAMERA_CAPTURE_JPEG_QUALITY;
 
   return config;
 }
@@ -781,6 +779,20 @@ void applySensorDefaults() {
   s->set_wpc(s, 1);
   s->set_raw_gma(s, 1);
   s->set_lenc(s, 1);
+}
+
+void applyPreviewSensorSettings() {
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return;
+
+  // Mantem no preview o mesmo ajuste enxuto do codigo de referencia.
+  s->set_vflip(s, 0);
+  s->set_hmirror(s, 0);
+  s->set_whitebal(s, 1);
+  s->set_gain_ctrl(s, 1);
+  s->set_exposure_ctrl(s, 1);
+  s->set_brightness(s, 0);
+  s->set_contrast(s, 0);
 }
 
 const char *frameSizeName(framesize_t frameSize) {
@@ -860,20 +872,12 @@ bool initializeCamera(CameraMode mode) {
   }
 
   if (cameraLigada) {
-    if (mode == CAMERA_CAPTURE_JPEG && cameraMode == CAMERA_PREVIEW_JPEG && captureProfileCached) {
-      if (setCameraFrameProfile(cachedCaptureFrameSize, CAMERA_CAPTURE_JPEG_QUALITY,
-                                CAMERA_CAPTURE_JPEG, CAPTURE_SENSOR_SETTLE_MS)) {
-        return true;
-      }
-      Serial.println("Perfil de captura memorizado falhou; reinicializando camera.");
-      captureProfileCached = false;
-    } else if (mode == CAMERA_PREVIEW_JPEG && cameraMode == CAMERA_CAPTURE_JPEG) {
-      return setCameraFrameProfile(CAMERA_PREVIEW_FRAME_SIZE, CAMERA_PREVIEW_JPEG_QUALITY,
-                                   CAMERA_PREVIEW_JPEG, PREVIEW_SENSOR_SETTLE_MS);
-    } else if (cameraMode == mode) {
+    if (cameraMode == mode) {
       return true;
     }
 
+    // Preview e captura usam formatos de pixel diferentes. O driver precisa ser
+    // reinicializado ao alternar RGB565 <-> JPEG.
     esp_camera_deinit();
     cameraLigada = false;
     cameraMode = CAMERA_OFF;
@@ -882,6 +886,32 @@ bool initializeCamera(CameraMode mode) {
 
   digitalWrite(PWDN_GPIO_NUM, LOW);
   delay(20);
+
+  if (mode == CAMERA_PREVIEW_RGB565) {
+    camera_config_t config = makeCameraConfig(
+      CAMERA_PREVIEW_RGB565, CAMERA_PREVIEW_FRAME_SIZE, false, 1);
+
+    Serial.println("Tentando camera RGB565 QQVGA em DRAM para preview.");
+    esp_err_t err = esp_camera_init(&config);
+    if (err == ESP_OK) {
+      applyPreviewSensorSettings();
+      esp_camera_return_all();
+      activeSensorFrameSize = CAMERA_PREVIEW_FRAME_SIZE;
+      cameraMode = CAMERA_PREVIEW_RGB565;
+      cameraLigada = true;
+      delay(PREVIEW_SENSOR_SETTLE_MS);
+      Serial.println("Camera inicializada em RGB565 QQVGA para preview nitido.");
+      return true;
+    }
+
+    Serial.printf("Falha ao inicializar preview RGB565: 0x%x\n", err);
+    esp_camera_deinit();
+    digitalWrite(PWDN_GPIO_NUM, HIGH);
+    delay(80);
+    cameraLigada = false;
+    cameraMode = CAMERA_OFF;
+    return false;
+  }
 
   struct CameraAttempt {
     framesize_t frameSize;
@@ -952,14 +982,9 @@ bool initializeCamera(CameraMode mode) {
         cachedCaptureUsesPsram = attempts[i].usePsram;
         cachedCaptureFbCount = attempts[i].fbCount;
 
-        bool profileOk = false;
-        if (mode == CAMERA_PREVIEW_JPEG) {
-          profileOk = setCameraFrameProfile(CAMERA_PREVIEW_FRAME_SIZE, CAMERA_PREVIEW_JPEG_QUALITY,
-                                            CAMERA_PREVIEW_JPEG, PREVIEW_SENSOR_SETTLE_MS);
-        } else {
-          profileOk = setCameraFrameProfile(cachedCaptureFrameSize, CAMERA_CAPTURE_JPEG_QUALITY,
-                                            CAMERA_CAPTURE_JPEG, CAPTURE_SENSOR_SETTLE_MS);
-        }
+        bool profileOk = setCameraFrameProfile(
+          cachedCaptureFrameSize, CAMERA_CAPTURE_JPEG_QUALITY,
+          CAMERA_CAPTURE_JPEG, CAPTURE_SENSOR_SETTLE_MS);
 
         if (!profileOk) {
           esp_camera_deinit();
@@ -999,7 +1024,7 @@ bool initializeCamera(CameraMode mode) {
 }
 
 bool iniciarCamera() {
-  return initializeCamera(CAMERA_PREVIEW_JPEG);
+  return initializeCamera(CAMERA_PREVIEW_RGB565);
 }
 
 void desligarCamera() {
@@ -1860,6 +1885,8 @@ void mostrarFrame(camera_fb_t *fb) {
   if (cropTop < 0) cropTop = 0;
 
   for (int y = 0; y < SCREEN_H; y++) {
+    // O codigo de referencia percorria as linhas de baixo para cima e por isso
+    // deixava a imagem invertida. Aqui a leitura segue de cima para baixo.
     int sourceY = y + cropTop;
     uint16_t *src = (uint16_t *)(fb->buf + sourceY * fb->width * 2);
 
@@ -1873,7 +1900,7 @@ void mostrarFrame(camera_fb_t *fb) {
 
 void updateCameraPreview() {
   if (appState != STATE_CAMERA) return;
-  if (!cameraLigada || cameraMode != CAMERA_PREVIEW_JPEG) return;
+  if (!cameraLigada || cameraMode != CAMERA_PREVIEW_RGB565) return;
 
   unsigned long now = millis();
   if (now - lastCameraFrameMs < cameraFrameIntervalMs) return;
@@ -1886,11 +1913,10 @@ void updateCameraPreview() {
     return;
   }
 
-  if (fb->format == PIXFORMAT_JPEG && fb->len > 0) {
-    drawJpegBufferToViewport(fb->buf, fb->len, 0, 0, SCREEN_W, SCREEN_H,
-                             CAMERA_PREVIEW_FILL_SCREEN != 0, false);
-  } else {
+  if (fb->format == PIXFORMAT_RGB565) {
     mostrarFrame(fb);
+  } else {
+    Serial.printf("Formato inesperado no preview: %d\n", fb->format);
   }
   esp_camera_fb_return(fb);
 
@@ -2136,7 +2162,7 @@ bool captureAndSavePhoto() {
 
   if (!initializeCamera(CAMERA_CAPTURE_JPEG)) {
     showStatus("Falha camera", COLOR_BAD, 1200);
-    initializeCamera(CAMERA_PREVIEW_JPEG);
+    initializeCamera(CAMERA_PREVIEW_RGB565);
     drawCameraScreen();
     return false;
   }
@@ -2152,7 +2178,7 @@ bool captureAndSavePhoto() {
   if (!fb) {
     Serial.println("Falha ao obter framebuffer JPEG para foto.");
     showStatus("Falha camera", COLOR_BAD, 1200);
-    initializeCamera(CAMERA_PREVIEW_JPEG);
+    initializeCamera(CAMERA_PREVIEW_RGB565);
     drawCameraScreen();
     return false;
   }
@@ -2161,7 +2187,7 @@ bool captureAndSavePhoto() {
     Serial.printf("Framebuffer invalido para foto. formato=%d len=%u\n", fb->format, (unsigned)fb->len);
     esp_camera_fb_return(fb);
     showStatus("JPEG invalido", COLOR_BAD, 1200);
-    initializeCamera(CAMERA_PREVIEW_JPEG);
+    initializeCamera(CAMERA_PREVIEW_RGB565);
     drawCameraScreen();
     return false;
   }
@@ -2172,7 +2198,7 @@ bool captureAndSavePhoto() {
   if (!beginSDSession()) {
     esp_camera_fb_return(fb);
     showStatus("SD nao encontrado", COLOR_WARN, 1400);
-    initializeCamera(CAMERA_PREVIEW_JPEG);
+    initializeCamera(CAMERA_PREVIEW_RGB565);
     drawCameraScreen();
     return false;
   }
@@ -2212,7 +2238,7 @@ bool captureAndSavePhoto() {
 
   endSDSession();
   esp_camera_fb_return(fb);
-  initializeCamera(CAMERA_PREVIEW_JPEG);
+  initializeCamera(CAMERA_PREVIEW_RGB565);
   drawCameraScreen();
 
   if (ok) {
@@ -2232,7 +2258,7 @@ void setAppState(AppState newState) {
 
   switch (newState) {
     case STATE_CAMERA:
-      initializeCamera(CAMERA_PREVIEW_JPEG);
+      initializeCamera(CAMERA_PREVIEW_RGB565);
       drawCameraScreen();
       break;
     case STATE_MAIN_MENU:
@@ -2578,7 +2604,7 @@ void setup() {
 
   initializeSDCard();
 
-  if (!initializeCamera(CAMERA_PREVIEW_JPEG)) {
+  if (!initializeCamera(CAMERA_PREVIEW_RGB565)) {
     showCenteredMessage("Falha camera", "ver Serial", COLOR_BAD);
     delay(1000);
   }
